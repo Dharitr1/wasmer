@@ -25,6 +25,7 @@ integration-tests: release
 	echo "Running Integration Tests"
 	./integration_tests/lua/test.sh
 	./integration_tests/nginx/test.sh
+	./integration_tests/cowsay/test.sh
 
 lint:
 	cargo fmt --all -- --check
@@ -82,6 +83,9 @@ production-release:
 
 debug-release:
 	cargo build --release --features "debug"
+
+extra-debug-release:
+	cargo build --release --features "extra-debug"
 
 publish-release:
 	ghr -t ${GITHUB_TOKEN} -u ${CIRCLE_PROJECT_USERNAME} -r ${CIRCLE_PROJECT_REPONAME} -c ${CIRCLE_SHA1} -delete ${VERSION} ./artifacts/
