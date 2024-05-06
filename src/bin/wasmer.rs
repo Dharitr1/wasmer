@@ -1,19 +1,5 @@
-#[macro_use]
-extern crate error_chain;
-extern crate cranelift_codegen;
-extern crate cranelift_entity;
-extern crate cranelift_native;
-extern crate cranelift_wasm;
-extern crate libc;
-extern crate memmap;
-extern crate region;
 extern crate structopt;
-extern crate wabt;
-extern crate wasmparser;
-#[macro_use]
-extern crate target_lexicon;
-extern crate nix;
-extern crate rayon;
+extern crate wasmer;
 
 use std::fs::File;
 use std::io;
@@ -23,14 +9,7 @@ use std::process::exit;
 
 use structopt::StructOpt;
 
-#[macro_use]
-mod macros;
-pub mod apis;
-pub mod common;
-pub mod sighandler;
-#[cfg(test)]
-mod spectests;
-pub mod webassembly;
+use wasmer::*;
 
 #[derive(Debug, StructOpt)]
 #[structopt(name = "wasmer", about = "WASM execution runtime.")]
@@ -39,6 +18,10 @@ enum CLIOptions {
     /// Run a WebAssembly file. Formats accepted: wasm, wast
     #[structopt(name = "run")]
     Run(Run),
+
+    /// Update wasmer to the latest version
+    #[structopt(name = "self-update")]
+    SelfUpdate,
 }
 
 #[derive(Debug, StructOpt)]
@@ -78,14 +61,23 @@ fn execute_wasm(wasm_path: PathBuf) -> Result<(), String> {
         webassembly::instantiate(wasm_binary, import_object)
             .map_err(|err| format!("Can't instantiate the WebAssembly module: {}", err))?;
 
-    if apis::is_emscripten_module(&module) {
+    if apis::emscripten::is_emscripten_module(&module) {
+        // Emscripten __ATINIT__
+        if let Some(&webassembly::Export::Function(environ_constructor_index)) = module.info.exports.get("___emscripten_environ_constructor") {
+            debug!("emscripten::___emscripten_environ_constructor");
+            let ___emscripten_environ_constructor: extern "C" fn(&webassembly::Instance) =
+                get_instance_function!(instance, environ_constructor_index);
+            call_protected!(___emscripten_environ_constructor(&instance)).map_err(|err| format!("{}", err))?;
+        };
+        // TODO: We also need to handle TTY.init() and SOCKFS.root = FS.mount(SOCKFS, {}, null)
         let func_index = match module.info.exports.get("_main") {
             Some(&webassembly::Export::Function(index)) => index,
             _ => panic!("_main emscripten function not found"),
         };
         let main: extern "C" fn(u32, u32, &webassembly::Instance) =
             get_instance_function!(instance, func_index);
-        main(0, 0, &instance);
+        return call_protected!(main(0, 0, &instance)).map_err(|err| format!("{}", err));
+        // TODO: We should implement emscripten __ATEXIT__
     } else {
         let func_index =
             instance
@@ -96,10 +88,8 @@ fn execute_wasm(wasm_path: PathBuf) -> Result<(), String> {
                 });
         let main: extern "C" fn(&webassembly::Instance) =
             get_instance_function!(instance, func_index);
-        main(&instance);
+        return call_protected!(main(&instance)).map_err(|err| format!("{}", err));
     }
-
-    Ok(())
 }
 
 fn run(options: Run) {
@@ -117,5 +107,6 @@ fn main() {
     let options = CLIOptions::from_args();
     match options {
         CLIOptions::Run(options) => run(options),
+        CLIOptions::SelfUpdate => update::self_update(),
     }
 }
