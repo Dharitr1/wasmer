@@ -1,5 +1,15 @@
-#![deny(unused_imports, unused_variables, unused_unsafe, unreachable_patterns)]
+#![deny(
+    dead_code,
+    nonstandard_style,
+    unused_imports,
+    unused_mut,
+    unused_variables,
+    unused_unsafe,
+    unreachable_patterns
+)]
 #![cfg_attr(nightly, feature(unwind_attributes))]
+#![doc(html_favicon_url = "https://wasmer.io/static/icons/favicon.ico")]
+#![doc(html_logo_url = "https://avatars3.githubusercontent.com/u/44205449?s=200&v=4")]
 
 #[cfg(test)]
 #[macro_use]
@@ -46,6 +56,8 @@ pub use trampoline_x64 as trampoline;
 #[cfg(all(unix, target_arch = "x86_64"))]
 pub mod fault;
 pub mod state;
+#[cfg(feature = "managed")]
+pub mod tiering;
 
 use self::error::CompileResult;
 #[doc(inline)]
@@ -132,9 +144,9 @@ pub fn validate_and_report_errors_with_features(
             enable_bulk_memory: false,
             enable_multi_value: false,
             enable_reference_types: false,
-            enable_threads: false,
+            enable_threads: features.threads,
         },
-        mutable_global_imports: false,
+        mutable_global_imports: true,
     };
     let mut parser = wasmparser::ValidatingParser::new(wasm, Some(config));
     loop {

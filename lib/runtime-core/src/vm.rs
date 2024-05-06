@@ -14,7 +14,7 @@ use std::{
     sync::Once,
 };
 
-use hashbrown::HashMap;
+use std::collections::HashMap;
 
 /// The context of the currently running WebAssembly instance.
 ///
@@ -208,7 +208,7 @@ fn get_intrinsics_for_module(m: &ModuleInfo) -> *const Intrinsics {
                 match mem_desc.memory_type() {
                     MemoryType::Dynamic => &INTRINSICS_LOCAL_DYNAMIC_MEMORY,
                     MemoryType::Static => &INTRINSICS_LOCAL_STATIC_MEMORY,
-                    MemoryType::SharedStatic => unimplemented!(),
+                    MemoryType::SharedStatic => &INTRINSICS_LOCAL_STATIC_MEMORY,
                 }
             }
             LocalOrImport::Import(import_mem_index) => {
@@ -216,7 +216,7 @@ fn get_intrinsics_for_module(m: &ModuleInfo) -> *const Intrinsics {
                 match mem_desc.memory_type() {
                     MemoryType::Dynamic => &INTRINSICS_IMPORTED_DYNAMIC_MEMORY,
                     MemoryType::Static => &INTRINSICS_IMPORTED_STATIC_MEMORY,
-                    MemoryType::SharedStatic => unimplemented!(),
+                    MemoryType::SharedStatic => &INTRINSICS_IMPORTED_STATIC_MEMORY,
                 }
             }
         }
@@ -763,7 +763,7 @@ mod vm_ctx_tests {
         x: u32,
         y: bool,
         str: String,
-        finalizer: Box<FnMut()>,
+        finalizer: Box<dyn FnMut()>,
     }
 
     impl Drop for TestData {
@@ -850,8 +850,9 @@ mod vm_ctx_tests {
         use crate::cache::Error as CacheError;
         use crate::typed_func::Wasm;
         use crate::types::{LocalFuncIndex, SigIndex};
-        use hashbrown::HashMap;
+        use indexmap::IndexMap;
         use std::any::Any;
+        use std::collections::HashMap;
         use std::ptr::NonNull;
         struct Placeholder;
         impl RunnableModule for Placeholder {
@@ -890,7 +891,7 @@ mod vm_ctx_tests {
                 imported_tables: Map::new(),
                 imported_globals: Map::new(),
 
-                exports: HashMap::new(),
+                exports: IndexMap::new(),
 
                 data_initializers: Vec::new(),
                 elem_initializers: Vec::new(),

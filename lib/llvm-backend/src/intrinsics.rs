@@ -1,5 +1,5 @@
-use hashbrown::HashMap;
 use inkwell::{
+    attributes::{Attribute, AttributeLoc},
     builder::Builder,
     context::Context,
     module::Module,
@@ -9,6 +9,7 @@ use inkwell::{
     values::{BasicValue, BasicValueEnum, FloatValue, FunctionValue, IntValue, PointerValue},
     AddressSpace,
 };
+use std::collections::HashMap;
 use std::marker::PhantomData;
 use wasmer_runtime_core::{
     memory::MemoryType,
@@ -18,7 +19,7 @@ use wasmer_runtime_core::{
         GlobalIndex, ImportedFuncIndex, LocalFuncIndex, LocalOrImport, MemoryIndex, SigIndex,
         TableIndex, Type,
     },
-    vm::Ctx,
+    vm::{Ctx, INTERNALS_SIZE},
 };
 
 fn type_to_llvm_ptr(intrinsics: &Intrinsics, ty: Type) -> PointerType {
@@ -130,6 +131,7 @@ pub struct Intrinsics {
     pub trap_call_indirect_oob: BasicValueEnum,
     pub trap_memory_oob: BasicValueEnum,
     pub trap_illegal_arithmetic: BasicValueEnum,
+    pub trap_misaligned_atomic: BasicValueEnum,
 
     // VM intrinsics.
     pub memory_grow_dynamic_local: FunctionValue,
@@ -147,6 +149,9 @@ pub struct Intrinsics {
     pub memory_size_shared_import: FunctionValue,
 
     pub throw_trap: FunctionValue,
+    pub throw_breakpoint: FunctionValue,
+
+    pub experimental_stackmap: FunctionValue,
 
     pub ctx_ptr_ty: PointerType,
 }
@@ -309,8 +314,7 @@ impl Intrinsics {
             i32_ty.fn_type(&[ctx_ptr_ty.as_basic_type_enum(), i32_ty_basic], false);
 
         let ret_i1_take_i1_i1 = i1_ty.fn_type(&[i1_ty_basic, i1_ty_basic], false);
-
-        Self {
+        let intrinsics = Self {
             ctlz_i32: module.add_function("llvm.ctlz.i32", ret_i32_take_i32_i1, None),
             ctlz_i64: module.add_function("llvm.ctlz.i64", ret_i64_take_i64_i1, None),
 
@@ -457,6 +461,7 @@ impl Intrinsics {
             trap_call_indirect_oob: i32_ty.const_int(3, false).as_basic_value_enum(),
             trap_memory_oob: i32_ty.const_int(2, false).as_basic_value_enum(),
             trap_illegal_arithmetic: i32_ty.const_int(4, false).as_basic_value_enum(),
+            trap_misaligned_atomic: i32_ty.const_int(5, false).as_basic_value_enum(),
 
             // VM intrinsics.
             memory_grow_dynamic_local: module.add_function(
@@ -525,8 +530,56 @@ impl Intrinsics {
                 void_ty.fn_type(&[i32_ty_basic], false),
                 None,
             ),
+            experimental_stackmap: module.add_function(
+                "llvm.experimental.stackmap",
+                void_ty.fn_type(
+                    &[
+                        i64_ty_basic, /* id */
+                        i32_ty_basic, /* numShadowBytes */
+                    ],
+                    true,
+                ),
+                None,
+            ),
+            throw_breakpoint: module.add_function(
+                "vm.breakpoint",
+                void_ty.fn_type(&[i64_ty_basic], false),
+                None,
+            ),
             ctx_ptr_ty,
-        }
+        };
+
+        let readonly =
+            context.create_enum_attribute(Attribute::get_named_enum_kind_id("readonly"), 0);
+        intrinsics
+            .memory_size_dynamic_local
+            .add_attribute(AttributeLoc::Function, readonly);
+        intrinsics
+            .memory_size_static_local
+            .add_attribute(AttributeLoc::Function, readonly);
+        intrinsics
+            .memory_size_shared_local
+            .add_attribute(AttributeLoc::Function, readonly);
+        intrinsics
+            .memory_size_dynamic_import
+            .add_attribute(AttributeLoc::Function, readonly);
+        intrinsics
+            .memory_size_static_import
+            .add_attribute(AttributeLoc::Function, readonly);
+        intrinsics
+            .memory_size_shared_import
+            .add_attribute(AttributeLoc::Function, readonly);
+
+        let noreturn =
+            context.create_enum_attribute(Attribute::get_named_enum_kind_id("noreturn"), 0);
+        intrinsics
+            .throw_trap
+            .add_attribute(AttributeLoc::Function, noreturn);
+        intrinsics
+            .throw_breakpoint
+            .add_attribute(AttributeLoc::Function, noreturn);
+
+        intrinsics
     }
 }
 
@@ -566,6 +619,8 @@ pub struct CtxType<'a> {
     info: &'a ModuleInfo,
     cache_builder: Builder,
 
+    cached_signal_mem: Option<PointerValue>,
+
     cached_memories: HashMap<MemoryIndex, MemoryCache>,
     cached_tables: HashMap<TableIndex, TableCache>,
     cached_sigindices: HashMap<SigIndex, IntValue>,
@@ -591,6 +646,8 @@ impl<'a> CtxType<'a> {
             info,
             cache_builder,
 
+            cached_signal_mem: None,
+
             cached_memories: HashMap::new(),
             cached_tables: HashMap::new(),
             cached_sigindices: HashMap::new(),
@@ -603,6 +660,27 @@ impl<'a> CtxType<'a> {
 
     pub fn basic(&self) -> BasicValueEnum {
         self.ctx_ptr_value.as_basic_value_enum()
+    }
+
+    pub fn signal_mem(&mut self) -> PointerValue {
+        if let Some(x) = self.cached_signal_mem {
+            return x;
+        }
+
+        let (ctx_ptr_value, cache_builder) = (self.ctx_ptr_value, &self.cache_builder);
+
+        let ptr_ptr = unsafe {
+            cache_builder.build_struct_gep(
+                ctx_ptr_value,
+                offset_to_index(Ctx::offset_interrupt_signal_mem()),
+                "interrupt_signal_mem_ptr",
+            )
+        };
+        let ptr = cache_builder
+            .build_load(ptr_ptr, "interrupt_signal_mem")
+            .into_pointer_value();
+        self.cached_signal_mem = Some(ptr);
+        ptr
     }
 
     pub fn memory(&mut self, index: MemoryIndex, intrinsics: &Intrinsics) -> MemoryCache {
@@ -678,12 +756,11 @@ impl<'a> CtxType<'a> {
         })
     }
 
-    pub fn table(
+    pub fn table_prepare(
         &mut self,
         index: TableIndex,
         intrinsics: &Intrinsics,
-        builder: &Builder,
-    ) -> (PointerValue, IntValue) {
+    ) -> (PointerValue, PointerValue) {
         let (cached_tables, info, ctx_ptr_value, cache_builder) = (
             &mut self.cached_tables,
             self.info,
@@ -742,6 +819,16 @@ impl<'a> CtxType<'a> {
             }
         });
 
+        (ptr_to_base_ptr, ptr_to_bounds)
+    }
+
+    pub fn table(
+        &mut self,
+        index: TableIndex,
+        intrinsics: &Intrinsics,
+        builder: &Builder,
+    ) -> (PointerValue, IntValue) {
+        let (ptr_to_base_ptr, ptr_to_bounds) = self.table_prepare(index, intrinsics);
         (
             builder
                 .build_load(ptr_to_base_ptr, "base_ptr")
@@ -941,5 +1028,32 @@ impl<'a> CtxType<'a> {
         });
 
         (imported_func_cache.func_ptr, imported_func_cache.ctx_ptr)
+    }
+
+    pub fn internal_field(
+        &mut self,
+        index: usize,
+        intrinsics: &Intrinsics,
+        builder: &Builder,
+    ) -> PointerValue {
+        assert!(index < INTERNALS_SIZE);
+
+        let local_internals_ptr_ptr = unsafe {
+            builder.build_struct_gep(
+                self.ctx_ptr_value,
+                offset_to_index(Ctx::offset_internals()),
+                "local_internals_ptr_ptr",
+            )
+        };
+        let local_internals_ptr = builder
+            .build_load(local_internals_ptr_ptr, "local_internals_ptr")
+            .into_pointer_value();
+        unsafe {
+            builder.build_in_bounds_gep(
+                local_internals_ptr,
+                &[intrinsics.i32_ty.const_int(index as u64, false)],
+                "local_internal_field_ptr",
+            )
+        }
     }
 }

@@ -6,6 +6,42 @@ Blocks of changes will separated by version increments.
 
 ## **[Unreleased]**
 
+## 0.7.0 - 2019-09-12
+
+Special thanks to @YaronWittenstein @penberg for their contributions.
+
+- [#776](https://github.com/wasmerio/wasmer/issues/776) Allow WASI preopened fds to be closed
+- [#774](https://github.com/wasmerio/wasmer/issues/774) Add more methods to the `WasiFile` trait
+- [#772](https://github.com/wasmerio/wasmer/issues/772) [#770](https://github.com/wasmerio/wasmer/issues/770) Handle more internal failures by passing back errors
+- [#756](https://github.com/wasmerio/wasmer/issues/756) Allow NULL parameter and 0 arity in `wasmer_export_func_call` C API
+- [#747](https://github.com/wasmerio/wasmer/issues/747) Return error instead of panicking on traps when using the Wasmer binary
+- [#741](https://github.com/wasmerio/wasmer/issues/741) Add validate Wasm fuzz target
+- [#733](https://github.com/wasmerio/wasmer/issues/733) Remove dependency on compiler backends for `middleware-common`
+- [#732](https://github.com/wasmerio/wasmer/issues/732) [#731](https://github.com/wasmerio/wasmer/issues/731) WASI bug fixes and improvements
+- [#726](https://github.com/wasmerio/wasmer/issues/726) Add serialization and deserialization for Wasi State
+- [#716](https://github.com/wasmerio/wasmer/issues/716) Improve portability of install script
+- [#714](https://github.com/wasmerio/wasmer/issues/714) Add Code of Conduct
+- [#708](https://github.com/wasmerio/wasmer/issues/708) Remove unconditional dependency on Cranelift in the C API
+- [#703](https://github.com/wasmerio/wasmer/issues/703) Fix compilation on AArch64 Linux
+- [#702](https://github.com/wasmerio/wasmer/issues/702) Add SharedMemory to Wasmer. Add `--enable-threads` flag, add partial implementation of atomics to LLVM backend.
+- [#698](https://github.com/wasmerio/wasmer/issues/698) [#690](https://github.com/wasmerio/wasmer/issues/690) [#687](https://github.com/wasmerio/wasmer/issues/690) Fix panics in Emscripten
+- [#689](https://github.com/wasmerio/wasmer/issues/689) Replace `wasmer_runtime_code::memory::Atomic` with `std::sync::atomic` atomics, changing its interface
+- [#680](https://github.com/wasmerio/wasmer/issues/680) [#673](https://github.com/wasmerio/wasmer/issues/673) [#669](https://github.com/wasmerio/wasmer/issues/669) [#660](https://github.com/wasmerio/wasmer/issues/660) [#659](https://github.com/wasmerio/wasmer/issues/659) Misc. runtime and singlepass fixes 
+- [#677](https://github.com/wasmerio/wasmer/issues/677) [#675](https://github.com/wasmerio/wasmer/issues/675) [#674](https://github.com/wasmerio/wasmer/issues/674) LLVM backend fixes and improvements
+- [#671](https://github.com/wasmerio/wasmer/issues/671) Implement fs polling in `wasi::poll_oneoff` for Unix-like platforms
+- [#656](https://github.com/wasmerio/wasmer/issues/656) Move CI to Azure Pipelines
+- [#650](https://github.com/wasmerio/wasmer/issues/650) Implement `wasi::path_rename`, improve WASI FS public api, and allow open files to exist even when the underlying file is deleted
+- [#643](https://github.com/wasmerio/wasmer/issues/643) Implement `wasi::path_symlink` and improve WASI FS public api IO error reporting
+- [#608](https://github.com/wasmerio/wasmer/issues/608) Implement wasi syscalls `fd_allocate`, `fd_sync`, `fd_pread`, `path_link`, `path_filestat_set_times`; update WASI fs API in a WIP way; reduce coupling of WASI code to host filesystem; make debug messages from WASI more readable; improve rights-checking when calling syscalls; implement reference counting on inodes; misc bug fixes and improvements
+- [#616](https://github.com/wasmerio/wasmer/issues/616) Create the import object separately from instance instantiation in `runtime-c-api`
+- [#620](https://github.com/wasmerio/wasmer/issues/620) Replace one `throw()` with `noexcept` in llvm backend
+- [#618](https://github.com/wasmerio/wasmer/issues/618) Implement `InternalEvent::Breakpoint` in the llvm backend to allow metering in llvm
+- [#615](https://github.com/wasmerio/wasmer/issues/615) Eliminate `FunctionEnvironment` construction in `feed_event()` speeding up to 70% of compilation in clif
+- [#609](https://github.com/wasmerio/wasmer/issues/609) Update dependencies
+- [#602](https://github.com/wasmerio/wasmer/issues/602) C api extract instance context from instance
+- [#590](https://github.com/wasmerio/wasmer/issues/590) Error visibility changes in wasmer-c-api
+- [#589](https://github.com/wasmerio/wasmer/issues/589) Make `wasmer_byte_array` fields `public` in wasmer-c-api
+
 ## 0.6.0 - 2019-07-31
 - [#603](https://github.com/wasmerio/wasmer/pull/603) Update Wapm-cli, bump version numbers
 - [#595](https://github.com/wasmerio/wasmer/pull/595) Add unstable public API for interfacing with the WASI file system in plugin-like usecases

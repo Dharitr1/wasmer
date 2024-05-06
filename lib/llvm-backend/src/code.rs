@@ -8,9 +8,11 @@ use inkwell::{
         BasicValue, BasicValueEnum, FloatValue, FunctionValue, IntValue, PhiValue, PointerValue,
         VectorValue,
     },
-    AddressSpace, FloatPredicate, IntPredicate,
+    AddressSpace, AtomicOrdering, AtomicRMWBinOp, FloatPredicate, IntPredicate,
 };
 use smallvec::SmallVec;
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::{Arc, RwLock};
 use wasmer_runtime_core::{
     backend::{Backend, CacheGen, Token},
@@ -28,10 +30,16 @@ use wasmparser::{BinaryReaderError, MemoryImmediate, Operator, Type as WpType};
 use crate::backend::LLVMBackend;
 use crate::intrinsics::{CtxType, GlobalCache, Intrinsics, MemoryCache};
 use crate::read_info::{blocktype_to_type, type_to_type};
+use crate::stackmap::{StackmapEntry, StackmapEntryKind, StackmapRegistry, ValueSemantic};
 use crate::state::{ControlFrame, IfElseState, State};
 use crate::trampolines::generate_trampolines;
 
-fn func_sig_to_llvm(context: &Context, intrinsics: &Intrinsics, sig: &FuncSig) -> FunctionType {
+fn func_sig_to_llvm(
+    context: &Context,
+    intrinsics: &Intrinsics,
+    sig: &FuncSig,
+    type_to_llvm: fn(intrinsics: &Intrinsics, ty: Type) -> BasicTypeEnum,
+) -> FunctionType {
     let user_param_types = sig.params().iter().map(|&ty| type_to_llvm(intrinsics, ty));
 
     let param_types: Vec<_> = std::iter::once(intrinsics.ctx_ptr_ty.as_basic_type_enum())
@@ -60,6 +68,14 @@ fn type_to_llvm(intrinsics: &Intrinsics, ty: Type) -> BasicTypeEnum {
         Type::I64 => intrinsics.i64_ty.as_basic_type_enum(),
         Type::F32 => intrinsics.f32_ty.as_basic_type_enum(),
         Type::F64 => intrinsics.f64_ty.as_basic_type_enum(),
+        Type::V128 => intrinsics.i128_ty.as_basic_type_enum(),
+    }
+}
+
+fn type_to_llvm_int_only(intrinsics: &Intrinsics, ty: Type) -> BasicTypeEnum {
+    match ty {
+        Type::I32 | Type::F32 => intrinsics.i32_ty.as_basic_type_enum(),
+        Type::I64 | Type::F64 => intrinsics.i64_ty.as_basic_type_enum(),
         Type::V128 => intrinsics.i128_ty.as_basic_type_enum(),
     }
 }
@@ -491,9 +507,161 @@ fn resolve_memory_ptr(
     Ok(builder.build_int_to_ptr(effective_address_int, ptr_ty, &state.var_name()))
 }
 
+fn emit_stack_map(
+    _module_info: &ModuleInfo,
+    intrinsics: &Intrinsics,
+    builder: &Builder,
+    local_function_id: usize,
+    target: &mut StackmapRegistry,
+    kind: StackmapEntryKind,
+    locals: &[PointerValue],
+    state: &State,
+    _ctx: &mut CtxType,
+    opcode_offset: usize,
+) {
+    let stackmap_id = target.entries.len();
+
+    let mut params = Vec::with_capacity(2 + locals.len() + state.stack.len());
+
+    params.push(
+        intrinsics
+            .i64_ty
+            .const_int(stackmap_id as u64, false)
+            .as_basic_value_enum(),
+    );
+    params.push(intrinsics.i32_ty.const_int(0, false).as_basic_value_enum());
+
+    let locals: Vec<_> = locals.iter().map(|x| x.as_basic_value_enum()).collect();
+    let mut value_semantics: Vec<ValueSemantic> =
+        Vec::with_capacity(locals.len() + state.stack.len());
+
+    params.extend_from_slice(&locals);
+    value_semantics.extend((0..locals.len()).map(ValueSemantic::WasmLocal));
+
+    params.extend_from_slice(&state.stack);
+    value_semantics.extend((0..state.stack.len()).map(ValueSemantic::WasmStack));
+
+    // FIXME: Information needed for Abstract -> Runtime state transform is not fully preserved
+    // to accelerate compilation and reduce memory usage. Check this again when we try to support
+    // "full" LLVM OSR.
+
+    assert_eq!(params.len(), value_semantics.len() + 2);
+
+    builder.build_call(intrinsics.experimental_stackmap, &params, &state.var_name());
+
+    target.entries.push(StackmapEntry {
+        kind,
+        local_function_id,
+        local_count: locals.len(),
+        stack_count: state.stack.len(),
+        opcode_offset,
+        value_semantics,
+        is_start: true,
+    });
+}
+
+fn finalize_opcode_stack_map(
+    intrinsics: &Intrinsics,
+    builder: &Builder,
+    local_function_id: usize,
+    target: &mut StackmapRegistry,
+    kind: StackmapEntryKind,
+    opcode_offset: usize,
+) {
+    let stackmap_id = target.entries.len();
+    builder.build_call(
+        intrinsics.experimental_stackmap,
+        &[
+            intrinsics
+                .i64_ty
+                .const_int(stackmap_id as u64, false)
+                .as_basic_value_enum(),
+            intrinsics.i32_ty.const_int(0, false).as_basic_value_enum(),
+        ],
+        "opcode_stack_map_end",
+    );
+    target.entries.push(StackmapEntry {
+        kind,
+        local_function_id,
+        local_count: 0,
+        stack_count: 0,
+        opcode_offset,
+        value_semantics: vec![],
+        is_start: false,
+    });
+}
+
+fn trap_if_misaligned(
+    builder: &Builder,
+    intrinsics: &Intrinsics,
+    context: &Context,
+    function: &FunctionValue,
+    memarg: &MemoryImmediate,
+    ptr: PointerValue,
+) {
+    let align = match memarg.flags & 3 {
+        0 => {
+            return; /* No alignment to check. */
+        }
+        1 => 2,
+        2 => 4,
+        3 => 8,
+        _ => unreachable!("this match is fully covered"),
+    };
+    let value = builder.build_ptr_to_int(ptr, intrinsics.i64_ty, "");
+    let and = builder.build_and(
+        value,
+        intrinsics.i64_ty.const_int(align - 1, false),
+        "misaligncheck",
+    );
+    let aligned = builder.build_int_compare(IntPredicate::EQ, and, intrinsics.i64_zero, "");
+    let aligned = builder
+        .build_call(
+            intrinsics.expect_i1,
+            &[
+                aligned.as_basic_value_enum(),
+                intrinsics.i1_ty.const_int(1, false).as_basic_value_enum(),
+            ],
+            "",
+        )
+        .try_as_basic_value()
+        .left()
+        .unwrap()
+        .into_int_value();
+
+    let continue_block = context.append_basic_block(function, "aligned_access_continue_block");
+    let not_aligned_block = context.append_basic_block(function, "misaligned_trap_block");
+    builder.build_conditional_branch(aligned, &continue_block, &not_aligned_block);
+
+    builder.position_at_end(&not_aligned_block);
+    builder.build_call(
+        intrinsics.throw_trap,
+        &[intrinsics.trap_misaligned_atomic],
+        "throw",
+    );
+    builder.build_unreachable();
+
+    builder.position_at_end(&continue_block);
+}
+
 #[derive(Debug)]
 pub struct CodegenError {
     pub message: String,
+}
+
+// This is only called by C++ code, the 'pub' + '#[no_mangle]' combination
+// prevents unused function elimination.
+#[no_mangle]
+pub unsafe extern "C" fn callback_trampoline(
+    b: *mut Option<Box<dyn std::any::Any>>,
+    callback: *mut BreakpointHandler,
+) {
+    let callback = Box::from_raw(callback);
+    let result: Result<(), Box<dyn std::any::Any>> = callback(BreakpointInfo { fault: None });
+    match result {
+        Ok(()) => *b = None,
+        Err(e) => *b = Some(e),
+    }
 }
 
 pub struct LLVMModuleCodeGenerator {
@@ -507,6 +675,7 @@ pub struct LLVMModuleCodeGenerator {
     func_import_count: usize,
     personality_func: FunctionValue,
     module: Module,
+    stackmaps: Rc<RefCell<StackmapRegistry>>,
 }
 
 pub struct LLVMFunctionCodeGenerator {
@@ -521,6 +690,9 @@ pub struct LLVMFunctionCodeGenerator {
     num_params: usize,
     ctx: Option<CtxType<'static>>,
     unreachable_depth: usize,
+    stackmaps: Rc<RefCell<StackmapRegistry>>,
+    index: usize,
+    opcode_offset: usize,
 }
 
 impl FunctionCodeGenerator<CodegenError> for LLVMFunctionCodeGenerator {
@@ -590,18 +762,39 @@ impl FunctionCodeGenerator<CodegenError> for LLVMFunctionCodeGenerator {
         let ctx = CtxType::new(module_info, function, cache_builder);
 
         self.ctx = Some(ctx);
+
+        {
+            let state = &mut self.state;
+            let builder = self.builder.as_ref().unwrap();
+            let intrinsics = self.intrinsics.as_ref().unwrap();
+
+            let mut stackmaps = self.stackmaps.borrow_mut();
+            emit_stack_map(
+                &module_info,
+                &intrinsics,
+                &builder,
+                self.index,
+                &mut *stackmaps,
+                StackmapEntryKind::FunctionHeader,
+                &self.locals,
+                &state,
+                self.ctx.as_mut().unwrap(),
+                ::std::usize::MAX,
+            );
+            finalize_opcode_stack_map(
+                &intrinsics,
+                &builder,
+                self.index,
+                &mut *stackmaps,
+                StackmapEntryKind::FunctionHeader,
+                ::std::usize::MAX,
+            );
+        }
+
         Ok(())
     }
 
     fn feed_event(&mut self, event: Event, module_info: &ModuleInfo) -> Result<(), CodegenError> {
-        let op = match event {
-            Event::Wasm(x) => x,
-            Event::Internal(_x) => {
-                return Ok(());
-            }
-            Event::WasmOwned(ref x) => x,
-        };
-
         let mut state = &mut self.state;
         let builder = self.builder.as_ref().unwrap();
         let context = self.context.as_ref().unwrap();
@@ -611,6 +804,50 @@ impl FunctionCodeGenerator<CodegenError> for LLVMFunctionCodeGenerator {
         let info = module_info;
         let signatures = &self.signatures;
         let mut ctx = self.ctx.as_mut().unwrap();
+
+        let mut opcode_offset: Option<usize> = None;
+        let op = match event {
+            Event::Wasm(x) => {
+                opcode_offset = Some(self.opcode_offset);
+                self.opcode_offset += 1;
+                x
+            }
+            Event::Internal(x) => {
+                match x {
+                    InternalEvent::FunctionBegin(_) | InternalEvent::FunctionEnd => {
+                        return Ok(());
+                    }
+                    InternalEvent::Breakpoint(callback) => {
+                        let raw = Box::into_raw(Box::new(callback)) as u64;
+                        let callback = intrinsics.i64_ty.const_int(raw, false);
+                        builder.build_call(
+                            intrinsics.throw_breakpoint,
+                            &[callback.as_basic_value_enum()],
+                            "",
+                        );
+                        return Ok(());
+                    }
+                    InternalEvent::GetInternal(idx) => {
+                        if state.reachable {
+                            let idx = idx as usize;
+                            let field_ptr = ctx.internal_field(idx, intrinsics, builder);
+                            let result = builder.build_load(field_ptr, "get_internal");
+                            state.push1(result);
+                        }
+                    }
+                    InternalEvent::SetInternal(idx) => {
+                        if state.reachable {
+                            let idx = idx as usize;
+                            let field_ptr = ctx.internal_field(idx, intrinsics, builder);
+                            let v = state.pop1()?;
+                            builder.build_store(field_ptr, v);
+                        }
+                    }
+                }
+                return Ok(());
+            }
+            Event::WasmOwned(ref x) => x,
+        };
 
         if !state.reachable {
             match *op {
@@ -680,6 +917,35 @@ impl FunctionCodeGenerator<CodegenError> for LLVMFunctionCodeGenerator {
                 };
 
                 builder.position_at_end(&loop_body);
+
+                if let Some(offset) = opcode_offset {
+                    let mut stackmaps = self.stackmaps.borrow_mut();
+                    emit_stack_map(
+                        &info,
+                        intrinsics,
+                        builder,
+                        self.index,
+                        &mut *stackmaps,
+                        StackmapEntryKind::Loop,
+                        &self.locals,
+                        state,
+                        ctx,
+                        offset,
+                    );
+                    let signal_mem = ctx.signal_mem();
+                    let iv = builder
+                        .build_store(signal_mem, context.i8_type().const_int(0 as u64, false));
+                    iv.set_volatile(true);
+                    finalize_opcode_stack_map(
+                        intrinsics,
+                        builder,
+                        self.index,
+                        &mut *stackmaps,
+                        StackmapEntryKind::Loop,
+                        offset,
+                    );
+                }
+
                 state.push_loop(loop_body, loop_next, phis);
             }
             Operator::Br { relative_depth } => {
@@ -941,6 +1207,33 @@ impl FunctionCodeGenerator<CodegenError> for LLVMFunctionCodeGenerator {
                 // If llvm cannot prove that this is never touched,
                 // it will emit a `ud2` instruction on x86_64 arches.
 
+                // Comment out this `if` block to allow spectests to pass.
+                // TODO: fix this
+                if let Some(offset) = opcode_offset {
+                    let mut stackmaps = self.stackmaps.borrow_mut();
+                    emit_stack_map(
+                        &info,
+                        intrinsics,
+                        builder,
+                        self.index,
+                        &mut *stackmaps,
+                        StackmapEntryKind::Trappable,
+                        &self.locals,
+                        state,
+                        ctx,
+                        offset,
+                    );
+                    builder.build_call(intrinsics.trap, &[], "trap");
+                    finalize_opcode_stack_map(
+                        intrinsics,
+                        builder,
+                        self.index,
+                        &mut *stackmaps,
+                        StackmapEntryKind::Trappable,
+                        offset,
+                    );
+                }
+
                 builder.build_call(
                     intrinsics.throw_trap,
                     &[intrinsics.trap_unreachable],
@@ -1105,7 +1398,9 @@ impl FunctionCodeGenerator<CodegenError> for LLVMFunctionCodeGenerator {
                         builder.build_store(ptr_to_value, value);
                     }
                     GlobalCache::Const { value: _ } => {
-                        unreachable!("cannot set non-mutable globals")
+                        return Err(CodegenError {
+                            message: "global is immutable".to_string(),
+                        });
                     }
                 }
             }
@@ -1127,26 +1422,59 @@ impl FunctionCodeGenerator<CodegenError> for LLVMFunctionCodeGenerator {
                 let llvm_sig = signatures[sigindex];
                 let func_sig = &info.signatures[sigindex];
 
-                let call_site = match func_index.local_or_import(info) {
+                let (params, func_ptr) = match func_index.local_or_import(info) {
                     LocalOrImport::Local(local_func_index) => {
-                        let params: Vec<_> = [ctx.basic()]
-                            .iter()
-                            .chain(state.peekn(func_sig.params().len())?.iter())
-                            .map(|v| *v)
+                        let params: Vec<_> = std::iter::once(ctx.basic())
+                            .chain(
+                                state
+                                    .peekn(func_sig.params().len())?
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(i, &v)| match func_sig.params()[i] {
+                                        Type::F32 => builder.build_bitcast(
+                                            v,
+                                            intrinsics.i32_ty,
+                                            &state.var_name(),
+                                        ),
+                                        Type::F64 => builder.build_bitcast(
+                                            v,
+                                            intrinsics.i64_ty,
+                                            &state.var_name(),
+                                        ),
+                                        _ => v,
+                                    }),
+                            )
                             .collect();
 
                         let func_ptr =
                             ctx.local_func(local_func_index, llvm_sig, intrinsics, builder);
 
-                        builder.build_call(func_ptr, &params, &state.var_name())
+                        (params, func_ptr)
                     }
                     LocalOrImport::Import(import_func_index) => {
                         let (func_ptr_untyped, ctx_ptr) =
                             ctx.imported_func(import_func_index, intrinsics);
-                        let params: Vec<_> = [ctx_ptr.as_basic_value_enum()]
-                            .iter()
-                            .chain(state.peekn(func_sig.params().len())?.iter())
-                            .map(|v| *v)
+
+                        let params: Vec<_> = std::iter::once(ctx_ptr.as_basic_value_enum())
+                            .chain(
+                                state
+                                    .peekn(func_sig.params().len())?
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(i, &v)| match func_sig.params()[i] {
+                                        Type::F32 => builder.build_bitcast(
+                                            v,
+                                            intrinsics.i32_ty,
+                                            &state.var_name(),
+                                        ),
+                                        Type::F64 => builder.build_bitcast(
+                                            v,
+                                            intrinsics.i64_ty,
+                                            &state.var_name(),
+                                        ),
+                                        _ => v,
+                                    }),
+                            )
                             .collect();
 
                         let func_ptr_ty = llvm_sig.ptr_type(AddressSpace::Generic);
@@ -1157,15 +1485,50 @@ impl FunctionCodeGenerator<CodegenError> for LLVMFunctionCodeGenerator {
                             "typed_func_ptr",
                         );
 
-                        builder.build_call(func_ptr, &params, &state.var_name())
+                        (params, func_ptr)
                     }
                 };
 
                 state.popn(func_sig.params().len())?;
+                if let Some(offset) = opcode_offset {
+                    let mut stackmaps = self.stackmaps.borrow_mut();
+                    emit_stack_map(
+                        &info,
+                        intrinsics,
+                        builder,
+                        self.index,
+                        &mut *stackmaps,
+                        StackmapEntryKind::Call,
+                        &self.locals,
+                        state,
+                        ctx,
+                        offset,
+                    )
+                }
+                let call_site = builder.build_call(func_ptr, &params, &state.var_name());
+                if let Some(offset) = opcode_offset {
+                    let mut stackmaps = self.stackmaps.borrow_mut();
+                    finalize_opcode_stack_map(
+                        intrinsics,
+                        builder,
+                        self.index,
+                        &mut *stackmaps,
+                        StackmapEntryKind::Call,
+                        offset,
+                    )
+                }
 
                 if let Some(basic_value) = call_site.try_as_basic_value().left() {
                     match func_sig.returns().len() {
-                        1 => state.push1(basic_value),
+                        1 => state.push1(match func_sig.returns()[0] {
+                            Type::F32 => {
+                                builder.build_bitcast(basic_value, intrinsics.f32_ty, "ret_cast")
+                            }
+                            Type::F64 => {
+                                builder.build_bitcast(basic_value, intrinsics.f64_ty, "ret_cast")
+                            }
+                            _ => basic_value,
+                        }),
                         count @ _ => {
                             // This is a multi-value return.
                             let struct_value = basic_value.into_struct_value();
@@ -1317,7 +1680,17 @@ impl FunctionCodeGenerator<CodegenError> for LLVMFunctionCodeGenerator {
                 let pushed_args = state.popn_save(wasmer_fn_sig.params().len())?;
 
                 let args: Vec<_> = std::iter::once(ctx_ptr)
-                    .chain(pushed_args.into_iter())
+                    .chain(pushed_args.into_iter().enumerate().map(|(i, v)| {
+                        match wasmer_fn_sig.params()[i] {
+                            Type::F32 => {
+                                builder.build_bitcast(v, intrinsics.i32_ty, &state.var_name())
+                            }
+                            Type::F64 => {
+                                builder.build_bitcast(v, intrinsics.i64_ty, &state.var_name())
+                            }
+                            _ => v,
+                        }
+                    }))
                     .collect();
 
                 let typed_func_ptr = builder.build_pointer_cast(
@@ -1326,13 +1699,47 @@ impl FunctionCodeGenerator<CodegenError> for LLVMFunctionCodeGenerator {
                     "typed_func_ptr",
                 );
 
+                if let Some(offset) = opcode_offset {
+                    let mut stackmaps = self.stackmaps.borrow_mut();
+                    emit_stack_map(
+                        &info,
+                        intrinsics,
+                        builder,
+                        self.index,
+                        &mut *stackmaps,
+                        StackmapEntryKind::Call,
+                        &self.locals,
+                        state,
+                        ctx,
+                        offset,
+                    )
+                }
                 let call_site = builder.build_call(typed_func_ptr, &args, "indirect_call");
+                if let Some(offset) = opcode_offset {
+                    let mut stackmaps = self.stackmaps.borrow_mut();
+                    finalize_opcode_stack_map(
+                        intrinsics,
+                        builder,
+                        self.index,
+                        &mut *stackmaps,
+                        StackmapEntryKind::Call,
+                        offset,
+                    )
+                }
 
                 match wasmer_fn_sig.returns() {
                     [] => {}
                     [_] => {
                         let value = call_site.try_as_basic_value().left().unwrap();
-                        state.push1(value);
+                        state.push1(match wasmer_fn_sig.returns()[0] {
+                            Type::F32 => {
+                                builder.build_bitcast(value, intrinsics.f32_ty, "ret_cast")
+                            }
+                            Type::F64 => {
+                                builder.build_bitcast(value, intrinsics.f64_ty, "ret_cast")
+                            }
+                            _ => value,
+                        });
                     }
                     _ => unimplemented!("multi-value returns"),
                 }
@@ -4347,6 +4754,2013 @@ impl FunctionCodeGenerator<CodegenError> for LLVMFunctionCodeGenerator {
                 let res = builder.build_bitcast(res, intrinsics.i128_ty, "");
                 state.push1(res);
             }
+            Operator::Fence { flags: _ } => {
+                // Fence is a nop.
+                //
+                // Fence was added to preserve information about fences from
+                // source languages. If in the future Wasm extends the memory
+                // model, and if we hadn't recorded what fences used to be there,
+                // it would lead to data races that weren't present in the
+                // original source language.
+            }
+            Operator::I32AtomicLoad { ref memarg } => {
+                let effective_address = resolve_memory_ptr(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    &mut state,
+                    &mut ctx,
+                    memarg,
+                    intrinsics.i32_ptr_ty,
+                    4,
+                )?;
+                trap_if_misaligned(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    memarg,
+                    effective_address,
+                );
+                let result = builder.build_load(effective_address, &state.var_name());
+                // TODO: LLVMSetAlignment(result.as_value_ref(), 4);
+                // TODO: LLVMSetOrdering(result.as_value_ref(), LLVMAtomicOrderingSequentiallyConsistent);
+                state.push1(result);
+            }
+            Operator::I64AtomicLoad { ref memarg } => {
+                let effective_address = resolve_memory_ptr(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    &mut state,
+                    &mut ctx,
+                    memarg,
+                    intrinsics.i64_ptr_ty,
+                    8,
+                )?;
+                trap_if_misaligned(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    memarg,
+                    effective_address,
+                );
+                let result = builder.build_load(effective_address, &state.var_name());
+                // TODO: LLVMSetAlignment(result.as_value_ref(), 8);
+                // TODO: LLVMSetOrdering(result.as_value_ref(), LLVMAtomicOrderingSequentiallyConsistent);
+                state.push1(result);
+            }
+            Operator::I32AtomicLoad8U { ref memarg } => {
+                let effective_address = resolve_memory_ptr(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    &mut state,
+                    &mut ctx,
+                    memarg,
+                    intrinsics.i8_ptr_ty,
+                    1,
+                )?;
+                trap_if_misaligned(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    memarg,
+                    effective_address,
+                );
+                let narrow_result = builder
+                    .build_load(effective_address, &state.var_name())
+                    .into_int_value();
+                // TODO: LLVMSetAlignment(result.as_value_ref(), 1);
+                // TODO: LLVMSetOrdering(result.as_value_ref(), LLVMAtomicOrderingSequentiallyConsistent);
+                let result =
+                    builder.build_int_z_extend(narrow_result, intrinsics.i32_ty, &state.var_name());
+                state.push1(result);
+            }
+            Operator::I32AtomicLoad16U { ref memarg } => {
+                let effective_address = resolve_memory_ptr(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    &mut state,
+                    &mut ctx,
+                    memarg,
+                    intrinsics.i16_ptr_ty,
+                    2,
+                )?;
+                trap_if_misaligned(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    memarg,
+                    effective_address,
+                );
+                let narrow_result = builder
+                    .build_load(effective_address, &state.var_name())
+                    .into_int_value();
+                // TODO: LLVMSetAlignment(result.as_value_ref(), 2);
+                // TODO: LLVMSetOrdering(result.as_value_ref(), LLVMAtomicOrderingSequentiallyConsistent);
+                let result =
+                    builder.build_int_z_extend(narrow_result, intrinsics.i32_ty, &state.var_name());
+                state.push1(result);
+            }
+            Operator::I64AtomicLoad8U { ref memarg } => {
+                let effective_address = resolve_memory_ptr(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    &mut state,
+                    &mut ctx,
+                    memarg,
+                    intrinsics.i8_ptr_ty,
+                    1,
+                )?;
+                trap_if_misaligned(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    memarg,
+                    effective_address,
+                );
+                let narrow_result = builder
+                    .build_load(effective_address, &state.var_name())
+                    .into_int_value();
+                // TODO: LLVMSetAlignment(result.as_value_ref(), 1);
+                // TODO: LLVMSetOrdering(result.as_value_ref(), LLVMAtomicOrderingSequentiallyConsistent);
+                let result =
+                    builder.build_int_z_extend(narrow_result, intrinsics.i64_ty, &state.var_name());
+                state.push1(result);
+            }
+            Operator::I64AtomicLoad16U { ref memarg } => {
+                let effective_address = resolve_memory_ptr(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    &mut state,
+                    &mut ctx,
+                    memarg,
+                    intrinsics.i16_ptr_ty,
+                    2,
+                )?;
+                trap_if_misaligned(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    memarg,
+                    effective_address,
+                );
+                let narrow_result = builder
+                    .build_load(effective_address, &state.var_name())
+                    .into_int_value();
+                // TODO: LLVMSetAlignment(result.as_value_ref(), 2);
+                // TODO: LLVMSetOrdering(result.as_value_ref(), LLVMAtomicOrderingSequentiallyConsistent);
+                let result =
+                    builder.build_int_z_extend(narrow_result, intrinsics.i64_ty, &state.var_name());
+                state.push1(result);
+            }
+            Operator::I64AtomicLoad32U { ref memarg } => {
+                let effective_address = resolve_memory_ptr(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    &mut state,
+                    &mut ctx,
+                    memarg,
+                    intrinsics.i32_ptr_ty,
+                    4,
+                )?;
+                trap_if_misaligned(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    memarg,
+                    effective_address,
+                );
+                let narrow_result = builder
+                    .build_load(effective_address, &state.var_name())
+                    .into_int_value();
+                // TODO: LLVMSetAlignment(result.as_value_ref(), 4);
+                // TODO: LLVMSetOrdering(result.as_value_ref(), LLVMAtomicOrderingSequentiallyConsistent);
+                let result =
+                    builder.build_int_z_extend(narrow_result, intrinsics.i64_ty, &state.var_name());
+                state.push1(result);
+            }
+            Operator::I32AtomicStore { ref memarg } => {
+                let value = state.pop1()?;
+                let effective_address = resolve_memory_ptr(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    &mut state,
+                    &mut ctx,
+                    memarg,
+                    intrinsics.i32_ptr_ty,
+                    4,
+                )?;
+                trap_if_misaligned(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    memarg,
+                    effective_address,
+                );
+                builder.build_store(effective_address, value);
+                // TODO: LLVMSetAlignment(result.as_value_ref(), 4);
+                // TODO: LLVMSetOrdering(result.as_value_ref(), LLVMAtomicOrderingSequentiallyConsistent);
+            }
+            Operator::I64AtomicStore { ref memarg } => {
+                let value = state.pop1()?;
+                let effective_address = resolve_memory_ptr(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    &mut state,
+                    &mut ctx,
+                    memarg,
+                    intrinsics.i64_ptr_ty,
+                    8,
+                )?;
+                trap_if_misaligned(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    memarg,
+                    effective_address,
+                );
+                builder.build_store(effective_address, value);
+                // TODO: LLVMSetAlignment(result.as_value_ref(), 8);
+                // TODO: LLVMSetOrdering(result.as_value_ref(), LLVMAtomicOrderingSequentiallyConsistent);
+            }
+            Operator::I32AtomicStore8 { ref memarg } | Operator::I64AtomicStore8 { ref memarg } => {
+                let value = state.pop1()?.into_int_value();
+                let effective_address = resolve_memory_ptr(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    &mut state,
+                    &mut ctx,
+                    memarg,
+                    intrinsics.i8_ptr_ty,
+                    1,
+                )?;
+                trap_if_misaligned(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    memarg,
+                    effective_address,
+                );
+                let narrow_value =
+                    builder.build_int_truncate(value, intrinsics.i8_ty, &state.var_name());
+                builder.build_store(effective_address, narrow_value);
+                // TODO: LLVMSetAlignment(result.as_value_ref(), 1);
+                // TODO: LLVMSetOrdering(result.as_value_ref(), LLVMAtomicOrderingSequentiallyConsistent);
+            }
+            Operator::I32AtomicStore16 { ref memarg }
+            | Operator::I64AtomicStore16 { ref memarg } => {
+                let value = state.pop1()?.into_int_value();
+                let effective_address = resolve_memory_ptr(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    &mut state,
+                    &mut ctx,
+                    memarg,
+                    intrinsics.i16_ptr_ty,
+                    2,
+                )?;
+                trap_if_misaligned(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    memarg,
+                    effective_address,
+                );
+                let narrow_value =
+                    builder.build_int_truncate(value, intrinsics.i16_ty, &state.var_name());
+                builder.build_store(effective_address, narrow_value);
+                // TODO: LLVMSetAlignment(result.as_value_ref(), 2);
+                // TODO: LLVMSetOrdering(result.as_value_ref(), LLVMAtomicOrderingSequentiallyConsistent);
+            }
+            Operator::I64AtomicStore32 { ref memarg } => {
+                let value = state.pop1()?.into_int_value();
+                let effective_address = resolve_memory_ptr(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    &mut state,
+                    &mut ctx,
+                    memarg,
+                    intrinsics.i32_ptr_ty,
+                    4,
+                )?;
+                trap_if_misaligned(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    memarg,
+                    effective_address,
+                );
+                let narrow_value =
+                    builder.build_int_truncate(value, intrinsics.i32_ty, &state.var_name());
+                builder.build_store(effective_address, narrow_value);
+                // TODO: LLVMSetAlignment(result.as_value_ref(), 4);
+                // TODO: LLVMSetOrdering(result.as_value_ref(), LLVMAtomicOrderingSequentiallyConsistent);
+            }
+            Operator::I32AtomicRmw8UAdd { ref memarg } => {
+                let value = state.pop1()?.into_int_value();
+                let effective_address = resolve_memory_ptr(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    &mut state,
+                    &mut ctx,
+                    memarg,
+                    intrinsics.i8_ptr_ty,
+                    1,
+                )?;
+                trap_if_misaligned(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    memarg,
+                    effective_address,
+                );
+                let narrow_value =
+                    builder.build_int_truncate(value, intrinsics.i8_ty, &state.var_name());
+                let old = builder
+                    .build_atomicrmw(
+                        AtomicRMWBinOp::Add,
+                        effective_address,
+                        narrow_value,
+                        AtomicOrdering::SequentiallyConsistent,
+                    )
+                    .unwrap();
+                let old = builder.build_int_z_extend(old, intrinsics.i32_ty, &state.var_name());
+                state.push1(old);
+            }
+            Operator::I32AtomicRmw16UAdd { ref memarg } => {
+                let value = state.pop1()?.into_int_value();
+                let effective_address = resolve_memory_ptr(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    &mut state,
+                    &mut ctx,
+                    memarg,
+                    intrinsics.i16_ptr_ty,
+                    2,
+                )?;
+                trap_if_misaligned(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    memarg,
+                    effective_address,
+                );
+                let narrow_value =
+                    builder.build_int_truncate(value, intrinsics.i16_ty, &state.var_name());
+                let old = builder
+                    .build_atomicrmw(
+                        AtomicRMWBinOp::Add,
+                        effective_address,
+                        narrow_value,
+                        AtomicOrdering::SequentiallyConsistent,
+                    )
+                    .unwrap();
+                let old = builder.build_int_z_extend(old, intrinsics.i32_ty, &state.var_name());
+                state.push1(old);
+            }
+            Operator::I32AtomicRmwAdd { ref memarg } => {
+                let value = state.pop1()?.into_int_value();
+                let effective_address = resolve_memory_ptr(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    &mut state,
+                    &mut ctx,
+                    memarg,
+                    intrinsics.i32_ptr_ty,
+                    4,
+                )?;
+                trap_if_misaligned(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    memarg,
+                    effective_address,
+                );
+                let old = builder
+                    .build_atomicrmw(
+                        AtomicRMWBinOp::Add,
+                        effective_address,
+                        value,
+                        AtomicOrdering::SequentiallyConsistent,
+                    )
+                    .unwrap();
+                state.push1(old);
+            }
+            Operator::I64AtomicRmw8UAdd { ref memarg } => {
+                let value = state.pop1()?.into_int_value();
+                let effective_address = resolve_memory_ptr(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    &mut state,
+                    &mut ctx,
+                    memarg,
+                    intrinsics.i8_ptr_ty,
+                    1,
+                )?;
+                trap_if_misaligned(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    memarg,
+                    effective_address,
+                );
+                let narrow_value =
+                    builder.build_int_truncate(value, intrinsics.i8_ty, &state.var_name());
+                let old = builder
+                    .build_atomicrmw(
+                        AtomicRMWBinOp::Add,
+                        effective_address,
+                        narrow_value,
+                        AtomicOrdering::SequentiallyConsistent,
+                    )
+                    .unwrap();
+                let old = builder.build_int_z_extend(old, intrinsics.i64_ty, &state.var_name());
+                state.push1(old);
+            }
+            Operator::I64AtomicRmw16UAdd { ref memarg } => {
+                let value = state.pop1()?.into_int_value();
+                let effective_address = resolve_memory_ptr(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    &mut state,
+                    &mut ctx,
+                    memarg,
+                    intrinsics.i16_ptr_ty,
+                    2,
+                )?;
+                trap_if_misaligned(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    memarg,
+                    effective_address,
+                );
+                let narrow_value =
+                    builder.build_int_truncate(value, intrinsics.i16_ty, &state.var_name());
+                let old = builder
+                    .build_atomicrmw(
+                        AtomicRMWBinOp::Add,
+                        effective_address,
+                        narrow_value,
+                        AtomicOrdering::SequentiallyConsistent,
+                    )
+                    .unwrap();
+                let old = builder.build_int_z_extend(old, intrinsics.i64_ty, &state.var_name());
+                state.push1(old);
+            }
+            Operator::I64AtomicRmw32UAdd { ref memarg } => {
+                let value = state.pop1()?.into_int_value();
+                let effective_address = resolve_memory_ptr(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    &mut state,
+                    &mut ctx,
+                    memarg,
+                    intrinsics.i32_ptr_ty,
+                    4,
+                )?;
+                trap_if_misaligned(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    memarg,
+                    effective_address,
+                );
+                let narrow_value =
+                    builder.build_int_truncate(value, intrinsics.i32_ty, &state.var_name());
+                let old = builder
+                    .build_atomicrmw(
+                        AtomicRMWBinOp::Add,
+                        effective_address,
+                        narrow_value,
+                        AtomicOrdering::SequentiallyConsistent,
+                    )
+                    .unwrap();
+                let old = builder.build_int_z_extend(old, intrinsics.i64_ty, &state.var_name());
+                state.push1(old);
+            }
+            Operator::I64AtomicRmwAdd { ref memarg } => {
+                let value = state.pop1()?.into_int_value();
+                let effective_address = resolve_memory_ptr(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    &mut state,
+                    &mut ctx,
+                    memarg,
+                    intrinsics.i64_ptr_ty,
+                    8,
+                )?;
+                trap_if_misaligned(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    memarg,
+                    effective_address,
+                );
+                let old = builder
+                    .build_atomicrmw(
+                        AtomicRMWBinOp::Add,
+                        effective_address,
+                        value,
+                        AtomicOrdering::SequentiallyConsistent,
+                    )
+                    .unwrap();
+                state.push1(old);
+            }
+            Operator::I32AtomicRmw8USub { ref memarg } => {
+                let value = state.pop1()?.into_int_value();
+                let effective_address = resolve_memory_ptr(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    &mut state,
+                    &mut ctx,
+                    memarg,
+                    intrinsics.i8_ptr_ty,
+                    1,
+                )?;
+                trap_if_misaligned(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    memarg,
+                    effective_address,
+                );
+                let narrow_value =
+                    builder.build_int_truncate(value, intrinsics.i8_ty, &state.var_name());
+                let old = builder
+                    .build_atomicrmw(
+                        AtomicRMWBinOp::Sub,
+                        effective_address,
+                        narrow_value,
+                        AtomicOrdering::SequentiallyConsistent,
+                    )
+                    .unwrap();
+                let old = builder.build_int_z_extend(old, intrinsics.i32_ty, &state.var_name());
+                state.push1(old);
+            }
+            Operator::I32AtomicRmw16USub { ref memarg } => {
+                let value = state.pop1()?.into_int_value();
+                let effective_address = resolve_memory_ptr(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    &mut state,
+                    &mut ctx,
+                    memarg,
+                    intrinsics.i16_ptr_ty,
+                    2,
+                )?;
+                trap_if_misaligned(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    memarg,
+                    effective_address,
+                );
+                let narrow_value =
+                    builder.build_int_truncate(value, intrinsics.i16_ty, &state.var_name());
+                let old = builder
+                    .build_atomicrmw(
+                        AtomicRMWBinOp::Sub,
+                        effective_address,
+                        narrow_value,
+                        AtomicOrdering::SequentiallyConsistent,
+                    )
+                    .unwrap();
+                let old = builder.build_int_z_extend(old, intrinsics.i32_ty, &state.var_name());
+                state.push1(old);
+            }
+            Operator::I32AtomicRmwSub { ref memarg } => {
+                let value = state.pop1()?.into_int_value();
+                let effective_address = resolve_memory_ptr(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    &mut state,
+                    &mut ctx,
+                    memarg,
+                    intrinsics.i32_ptr_ty,
+                    4,
+                )?;
+                trap_if_misaligned(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    memarg,
+                    effective_address,
+                );
+                let old = builder
+                    .build_atomicrmw(
+                        AtomicRMWBinOp::Sub,
+                        effective_address,
+                        value,
+                        AtomicOrdering::SequentiallyConsistent,
+                    )
+                    .unwrap();
+                state.push1(old);
+            }
+            Operator::I64AtomicRmw8USub { ref memarg } => {
+                let value = state.pop1()?.into_int_value();
+                let effective_address = resolve_memory_ptr(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    &mut state,
+                    &mut ctx,
+                    memarg,
+                    intrinsics.i8_ptr_ty,
+                    1,
+                )?;
+                trap_if_misaligned(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    memarg,
+                    effective_address,
+                );
+                let narrow_value =
+                    builder.build_int_truncate(value, intrinsics.i8_ty, &state.var_name());
+                let old = builder
+                    .build_atomicrmw(
+                        AtomicRMWBinOp::Sub,
+                        effective_address,
+                        narrow_value,
+                        AtomicOrdering::SequentiallyConsistent,
+                    )
+                    .unwrap();
+                let old = builder.build_int_z_extend(old, intrinsics.i64_ty, &state.var_name());
+                state.push1(old);
+            }
+            Operator::I64AtomicRmw16USub { ref memarg } => {
+                let value = state.pop1()?.into_int_value();
+                let effective_address = resolve_memory_ptr(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    &mut state,
+                    &mut ctx,
+                    memarg,
+                    intrinsics.i16_ptr_ty,
+                    2,
+                )?;
+                trap_if_misaligned(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    memarg,
+                    effective_address,
+                );
+                let narrow_value =
+                    builder.build_int_truncate(value, intrinsics.i16_ty, &state.var_name());
+                let old = builder
+                    .build_atomicrmw(
+                        AtomicRMWBinOp::Sub,
+                        effective_address,
+                        narrow_value,
+                        AtomicOrdering::SequentiallyConsistent,
+                    )
+                    .unwrap();
+                let old = builder.build_int_z_extend(old, intrinsics.i64_ty, &state.var_name());
+                state.push1(old);
+            }
+            Operator::I64AtomicRmw32USub { ref memarg } => {
+                let value = state.pop1()?.into_int_value();
+                let effective_address = resolve_memory_ptr(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    &mut state,
+                    &mut ctx,
+                    memarg,
+                    intrinsics.i32_ptr_ty,
+                    4,
+                )?;
+                trap_if_misaligned(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    memarg,
+                    effective_address,
+                );
+                let narrow_value =
+                    builder.build_int_truncate(value, intrinsics.i32_ty, &state.var_name());
+                let old = builder
+                    .build_atomicrmw(
+                        AtomicRMWBinOp::Sub,
+                        effective_address,
+                        narrow_value,
+                        AtomicOrdering::SequentiallyConsistent,
+                    )
+                    .unwrap();
+                let old = builder.build_int_z_extend(old, intrinsics.i64_ty, &state.var_name());
+                state.push1(old);
+            }
+            Operator::I64AtomicRmwSub { ref memarg } => {
+                let value = state.pop1()?.into_int_value();
+                let effective_address = resolve_memory_ptr(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    &mut state,
+                    &mut ctx,
+                    memarg,
+                    intrinsics.i64_ptr_ty,
+                    8,
+                )?;
+                trap_if_misaligned(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    memarg,
+                    effective_address,
+                );
+                let old = builder
+                    .build_atomicrmw(
+                        AtomicRMWBinOp::Sub,
+                        effective_address,
+                        value,
+                        AtomicOrdering::SequentiallyConsistent,
+                    )
+                    .unwrap();
+                state.push1(old);
+            }
+            Operator::I32AtomicRmw8UAnd { ref memarg } => {
+                let value = state.pop1()?.into_int_value();
+                let effective_address = resolve_memory_ptr(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    &mut state,
+                    &mut ctx,
+                    memarg,
+                    intrinsics.i8_ptr_ty,
+                    1,
+                )?;
+                trap_if_misaligned(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    memarg,
+                    effective_address,
+                );
+                let narrow_value =
+                    builder.build_int_truncate(value, intrinsics.i8_ty, &state.var_name());
+                let old = builder
+                    .build_atomicrmw(
+                        AtomicRMWBinOp::And,
+                        effective_address,
+                        narrow_value,
+                        AtomicOrdering::SequentiallyConsistent,
+                    )
+                    .unwrap();
+                let old = builder.build_int_z_extend(old, intrinsics.i32_ty, &state.var_name());
+                state.push1(old);
+            }
+            Operator::I32AtomicRmw16UAnd { ref memarg } => {
+                let value = state.pop1()?.into_int_value();
+                let effective_address = resolve_memory_ptr(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    &mut state,
+                    &mut ctx,
+                    memarg,
+                    intrinsics.i16_ptr_ty,
+                    2,
+                )?;
+                trap_if_misaligned(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    memarg,
+                    effective_address,
+                );
+                let narrow_value =
+                    builder.build_int_truncate(value, intrinsics.i16_ty, &state.var_name());
+                let old = builder
+                    .build_atomicrmw(
+                        AtomicRMWBinOp::And,
+                        effective_address,
+                        narrow_value,
+                        AtomicOrdering::SequentiallyConsistent,
+                    )
+                    .unwrap();
+                let old = builder.build_int_z_extend(old, intrinsics.i32_ty, &state.var_name());
+                state.push1(old);
+            }
+            Operator::I32AtomicRmwAnd { ref memarg } => {
+                let value = state.pop1()?.into_int_value();
+                let effective_address = resolve_memory_ptr(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    &mut state,
+                    &mut ctx,
+                    memarg,
+                    intrinsics.i32_ptr_ty,
+                    4,
+                )?;
+                trap_if_misaligned(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    memarg,
+                    effective_address,
+                );
+                let old = builder
+                    .build_atomicrmw(
+                        AtomicRMWBinOp::And,
+                        effective_address,
+                        value,
+                        AtomicOrdering::SequentiallyConsistent,
+                    )
+                    .unwrap();
+                state.push1(old);
+            }
+            Operator::I64AtomicRmw8UAnd { ref memarg } => {
+                let value = state.pop1()?.into_int_value();
+                let effective_address = resolve_memory_ptr(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    &mut state,
+                    &mut ctx,
+                    memarg,
+                    intrinsics.i8_ptr_ty,
+                    1,
+                )?;
+                trap_if_misaligned(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    memarg,
+                    effective_address,
+                );
+                let narrow_value =
+                    builder.build_int_truncate(value, intrinsics.i8_ty, &state.var_name());
+                let old = builder
+                    .build_atomicrmw(
+                        AtomicRMWBinOp::And,
+                        effective_address,
+                        narrow_value,
+                        AtomicOrdering::SequentiallyConsistent,
+                    )
+                    .unwrap();
+                let old = builder.build_int_z_extend(old, intrinsics.i64_ty, &state.var_name());
+                state.push1(old);
+            }
+            Operator::I64AtomicRmw16UAnd { ref memarg } => {
+                let value = state.pop1()?.into_int_value();
+                let effective_address = resolve_memory_ptr(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    &mut state,
+                    &mut ctx,
+                    memarg,
+                    intrinsics.i16_ptr_ty,
+                    2,
+                )?;
+                trap_if_misaligned(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    memarg,
+                    effective_address,
+                );
+                let narrow_value =
+                    builder.build_int_truncate(value, intrinsics.i16_ty, &state.var_name());
+                let old = builder
+                    .build_atomicrmw(
+                        AtomicRMWBinOp::And,
+                        effective_address,
+                        narrow_value,
+                        AtomicOrdering::SequentiallyConsistent,
+                    )
+                    .unwrap();
+                let old = builder.build_int_z_extend(old, intrinsics.i64_ty, &state.var_name());
+                state.push1(old);
+            }
+            Operator::I64AtomicRmw32UAnd { ref memarg } => {
+                let value = state.pop1()?.into_int_value();
+                let effective_address = resolve_memory_ptr(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    &mut state,
+                    &mut ctx,
+                    memarg,
+                    intrinsics.i32_ptr_ty,
+                    4,
+                )?;
+                trap_if_misaligned(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    memarg,
+                    effective_address,
+                );
+                let narrow_value =
+                    builder.build_int_truncate(value, intrinsics.i32_ty, &state.var_name());
+                let old = builder
+                    .build_atomicrmw(
+                        AtomicRMWBinOp::And,
+                        effective_address,
+                        narrow_value,
+                        AtomicOrdering::SequentiallyConsistent,
+                    )
+                    .unwrap();
+                let old = builder.build_int_z_extend(old, intrinsics.i64_ty, &state.var_name());
+                state.push1(old);
+            }
+            Operator::I64AtomicRmwAnd { ref memarg } => {
+                let value = state.pop1()?.into_int_value();
+                let effective_address = resolve_memory_ptr(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    &mut state,
+                    &mut ctx,
+                    memarg,
+                    intrinsics.i64_ptr_ty,
+                    8,
+                )?;
+                trap_if_misaligned(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    memarg,
+                    effective_address,
+                );
+                let old = builder
+                    .build_atomicrmw(
+                        AtomicRMWBinOp::And,
+                        effective_address,
+                        value,
+                        AtomicOrdering::SequentiallyConsistent,
+                    )
+                    .unwrap();
+                state.push1(old);
+            }
+            Operator::I32AtomicRmw8UOr { ref memarg } => {
+                let value = state.pop1()?.into_int_value();
+                let effective_address = resolve_memory_ptr(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    &mut state,
+                    &mut ctx,
+                    memarg,
+                    intrinsics.i8_ptr_ty,
+                    1,
+                )?;
+                trap_if_misaligned(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    memarg,
+                    effective_address,
+                );
+                let narrow_value =
+                    builder.build_int_truncate(value, intrinsics.i8_ty, &state.var_name());
+                let old = builder
+                    .build_atomicrmw(
+                        AtomicRMWBinOp::Or,
+                        effective_address,
+                        narrow_value,
+                        AtomicOrdering::SequentiallyConsistent,
+                    )
+                    .unwrap();
+                let old = builder.build_int_z_extend(old, intrinsics.i32_ty, &state.var_name());
+                state.push1(old);
+            }
+            Operator::I32AtomicRmw16UOr { ref memarg } => {
+                let value = state.pop1()?.into_int_value();
+                let effective_address = resolve_memory_ptr(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    &mut state,
+                    &mut ctx,
+                    memarg,
+                    intrinsics.i16_ptr_ty,
+                    2,
+                )?;
+                trap_if_misaligned(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    memarg,
+                    effective_address,
+                );
+                let narrow_value =
+                    builder.build_int_truncate(value, intrinsics.i16_ty, &state.var_name());
+                let old = builder
+                    .build_atomicrmw(
+                        AtomicRMWBinOp::Or,
+                        effective_address,
+                        narrow_value,
+                        AtomicOrdering::SequentiallyConsistent,
+                    )
+                    .unwrap();
+                let old = builder.build_int_z_extend(old, intrinsics.i32_ty, &state.var_name());
+                state.push1(old);
+            }
+            Operator::I32AtomicRmwOr { ref memarg } => {
+                let value = state.pop1()?.into_int_value();
+                let effective_address = resolve_memory_ptr(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    &mut state,
+                    &mut ctx,
+                    memarg,
+                    intrinsics.i32_ptr_ty,
+                    4,
+                )?;
+                trap_if_misaligned(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    memarg,
+                    effective_address,
+                );
+                let old = builder
+                    .build_atomicrmw(
+                        AtomicRMWBinOp::Or,
+                        effective_address,
+                        value,
+                        AtomicOrdering::SequentiallyConsistent,
+                    )
+                    .unwrap();
+                let old = builder.build_int_z_extend(old, intrinsics.i32_ty, &state.var_name());
+                state.push1(old);
+            }
+            Operator::I64AtomicRmw8UOr { ref memarg } => {
+                let value = state.pop1()?.into_int_value();
+                let effective_address = resolve_memory_ptr(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    &mut state,
+                    &mut ctx,
+                    memarg,
+                    intrinsics.i8_ptr_ty,
+                    1,
+                )?;
+                trap_if_misaligned(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    memarg,
+                    effective_address,
+                );
+                let narrow_value =
+                    builder.build_int_truncate(value, intrinsics.i8_ty, &state.var_name());
+                let old = builder
+                    .build_atomicrmw(
+                        AtomicRMWBinOp::Or,
+                        effective_address,
+                        narrow_value,
+                        AtomicOrdering::SequentiallyConsistent,
+                    )
+                    .unwrap();
+                let old = builder.build_int_z_extend(old, intrinsics.i64_ty, &state.var_name());
+                state.push1(old);
+            }
+            Operator::I64AtomicRmw16UOr { ref memarg } => {
+                let value = state.pop1()?.into_int_value();
+                let effective_address = resolve_memory_ptr(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    &mut state,
+                    &mut ctx,
+                    memarg,
+                    intrinsics.i16_ptr_ty,
+                    2,
+                )?;
+                trap_if_misaligned(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    memarg,
+                    effective_address,
+                );
+                let narrow_value =
+                    builder.build_int_truncate(value, intrinsics.i16_ty, &state.var_name());
+                let old = builder
+                    .build_atomicrmw(
+                        AtomicRMWBinOp::Or,
+                        effective_address,
+                        narrow_value,
+                        AtomicOrdering::SequentiallyConsistent,
+                    )
+                    .unwrap();
+                let old = builder.build_int_z_extend(old, intrinsics.i64_ty, &state.var_name());
+                state.push1(old);
+            }
+            Operator::I64AtomicRmw32UOr { ref memarg } => {
+                let value = state.pop1()?.into_int_value();
+                let effective_address = resolve_memory_ptr(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    &mut state,
+                    &mut ctx,
+                    memarg,
+                    intrinsics.i32_ptr_ty,
+                    4,
+                )?;
+                trap_if_misaligned(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    memarg,
+                    effective_address,
+                );
+                let narrow_value =
+                    builder.build_int_truncate(value, intrinsics.i32_ty, &state.var_name());
+                let old = builder
+                    .build_atomicrmw(
+                        AtomicRMWBinOp::Or,
+                        effective_address,
+                        narrow_value,
+                        AtomicOrdering::SequentiallyConsistent,
+                    )
+                    .unwrap();
+                let old = builder.build_int_z_extend(old, intrinsics.i64_ty, &state.var_name());
+                state.push1(old);
+            }
+            Operator::I64AtomicRmwOr { ref memarg } => {
+                let value = state.pop1()?.into_int_value();
+                let effective_address = resolve_memory_ptr(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    &mut state,
+                    &mut ctx,
+                    memarg,
+                    intrinsics.i64_ptr_ty,
+                    8,
+                )?;
+                trap_if_misaligned(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    memarg,
+                    effective_address,
+                );
+                let old = builder
+                    .build_atomicrmw(
+                        AtomicRMWBinOp::Or,
+                        effective_address,
+                        value,
+                        AtomicOrdering::SequentiallyConsistent,
+                    )
+                    .unwrap();
+                state.push1(old);
+            }
+            Operator::I32AtomicRmw8UXor { ref memarg } => {
+                let value = state.pop1()?.into_int_value();
+                let effective_address = resolve_memory_ptr(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    &mut state,
+                    &mut ctx,
+                    memarg,
+                    intrinsics.i8_ptr_ty,
+                    1,
+                )?;
+                trap_if_misaligned(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    memarg,
+                    effective_address,
+                );
+                let narrow_value =
+                    builder.build_int_truncate(value, intrinsics.i8_ty, &state.var_name());
+                let old = builder
+                    .build_atomicrmw(
+                        AtomicRMWBinOp::Xor,
+                        effective_address,
+                        narrow_value,
+                        AtomicOrdering::SequentiallyConsistent,
+                    )
+                    .unwrap();
+                let old = builder.build_int_z_extend(old, intrinsics.i32_ty, &state.var_name());
+                state.push1(old);
+            }
+            Operator::I32AtomicRmw16UXor { ref memarg } => {
+                let value = state.pop1()?.into_int_value();
+                let effective_address = resolve_memory_ptr(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    &mut state,
+                    &mut ctx,
+                    memarg,
+                    intrinsics.i16_ptr_ty,
+                    2,
+                )?;
+                trap_if_misaligned(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    memarg,
+                    effective_address,
+                );
+                let narrow_value =
+                    builder.build_int_truncate(value, intrinsics.i16_ty, &state.var_name());
+                let old = builder
+                    .build_atomicrmw(
+                        AtomicRMWBinOp::Xor,
+                        effective_address,
+                        narrow_value,
+                        AtomicOrdering::SequentiallyConsistent,
+                    )
+                    .unwrap();
+                let old = builder.build_int_z_extend(old, intrinsics.i32_ty, &state.var_name());
+                state.push1(old);
+            }
+            Operator::I32AtomicRmwXor { ref memarg } => {
+                let value = state.pop1()?.into_int_value();
+                let effective_address = resolve_memory_ptr(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    &mut state,
+                    &mut ctx,
+                    memarg,
+                    intrinsics.i32_ptr_ty,
+                    4,
+                )?;
+                trap_if_misaligned(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    memarg,
+                    effective_address,
+                );
+                let old = builder
+                    .build_atomicrmw(
+                        AtomicRMWBinOp::Xor,
+                        effective_address,
+                        value,
+                        AtomicOrdering::SequentiallyConsistent,
+                    )
+                    .unwrap();
+                state.push1(old);
+            }
+            Operator::I64AtomicRmw8UXor { ref memarg } => {
+                let value = state.pop1()?.into_int_value();
+                let effective_address = resolve_memory_ptr(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    &mut state,
+                    &mut ctx,
+                    memarg,
+                    intrinsics.i8_ptr_ty,
+                    1,
+                )?;
+                trap_if_misaligned(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    memarg,
+                    effective_address,
+                );
+                let narrow_value =
+                    builder.build_int_truncate(value, intrinsics.i8_ty, &state.var_name());
+                let old = builder
+                    .build_atomicrmw(
+                        AtomicRMWBinOp::Xor,
+                        effective_address,
+                        narrow_value,
+                        AtomicOrdering::SequentiallyConsistent,
+                    )
+                    .unwrap();
+                let old = builder.build_int_z_extend(old, intrinsics.i64_ty, &state.var_name());
+                state.push1(old);
+            }
+            Operator::I64AtomicRmw16UXor { ref memarg } => {
+                let value = state.pop1()?.into_int_value();
+                let effective_address = resolve_memory_ptr(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    &mut state,
+                    &mut ctx,
+                    memarg,
+                    intrinsics.i16_ptr_ty,
+                    2,
+                )?;
+                trap_if_misaligned(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    memarg,
+                    effective_address,
+                );
+                let narrow_value =
+                    builder.build_int_truncate(value, intrinsics.i16_ty, &state.var_name());
+                let old = builder
+                    .build_atomicrmw(
+                        AtomicRMWBinOp::Xor,
+                        effective_address,
+                        narrow_value,
+                        AtomicOrdering::SequentiallyConsistent,
+                    )
+                    .unwrap();
+                let old = builder.build_int_z_extend(old, intrinsics.i64_ty, &state.var_name());
+                state.push1(old);
+            }
+            Operator::I64AtomicRmw32UXor { ref memarg } => {
+                let value = state.pop1()?.into_int_value();
+                let effective_address = resolve_memory_ptr(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    &mut state,
+                    &mut ctx,
+                    memarg,
+                    intrinsics.i32_ptr_ty,
+                    4,
+                )?;
+                trap_if_misaligned(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    memarg,
+                    effective_address,
+                );
+                let narrow_value =
+                    builder.build_int_truncate(value, intrinsics.i32_ty, &state.var_name());
+                let old = builder
+                    .build_atomicrmw(
+                        AtomicRMWBinOp::Xor,
+                        effective_address,
+                        narrow_value,
+                        AtomicOrdering::SequentiallyConsistent,
+                    )
+                    .unwrap();
+                let old = builder.build_int_z_extend(old, intrinsics.i64_ty, &state.var_name());
+                state.push1(old);
+            }
+            Operator::I64AtomicRmwXor { ref memarg } => {
+                let value = state.pop1()?.into_int_value();
+                let effective_address = resolve_memory_ptr(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    &mut state,
+                    &mut ctx,
+                    memarg,
+                    intrinsics.i64_ptr_ty,
+                    8,
+                )?;
+                trap_if_misaligned(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    memarg,
+                    effective_address,
+                );
+                let old = builder
+                    .build_atomicrmw(
+                        AtomicRMWBinOp::Xor,
+                        effective_address,
+                        value,
+                        AtomicOrdering::SequentiallyConsistent,
+                    )
+                    .unwrap();
+                state.push1(old);
+            }
+            Operator::I32AtomicRmw8UXchg { ref memarg } => {
+                let value = state.pop1()?.into_int_value();
+                let effective_address = resolve_memory_ptr(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    &mut state,
+                    &mut ctx,
+                    memarg,
+                    intrinsics.i8_ptr_ty,
+                    1,
+                )?;
+                trap_if_misaligned(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    memarg,
+                    effective_address,
+                );
+                let narrow_value =
+                    builder.build_int_truncate(value, intrinsics.i8_ty, &state.var_name());
+                let old = builder
+                    .build_atomicrmw(
+                        AtomicRMWBinOp::Xchg,
+                        effective_address,
+                        narrow_value,
+                        AtomicOrdering::SequentiallyConsistent,
+                    )
+                    .unwrap();
+                let old = builder.build_int_z_extend(old, intrinsics.i32_ty, &state.var_name());
+                state.push1(old);
+            }
+            Operator::I32AtomicRmw16UXchg { ref memarg } => {
+                let value = state.pop1()?.into_int_value();
+                let effective_address = resolve_memory_ptr(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    &mut state,
+                    &mut ctx,
+                    memarg,
+                    intrinsics.i16_ptr_ty,
+                    2,
+                )?;
+                trap_if_misaligned(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    memarg,
+                    effective_address,
+                );
+                let narrow_value =
+                    builder.build_int_truncate(value, intrinsics.i16_ty, &state.var_name());
+                let old = builder
+                    .build_atomicrmw(
+                        AtomicRMWBinOp::Xchg,
+                        effective_address,
+                        narrow_value,
+                        AtomicOrdering::SequentiallyConsistent,
+                    )
+                    .unwrap();
+                let old = builder.build_int_z_extend(old, intrinsics.i32_ty, &state.var_name());
+                state.push1(old);
+            }
+            Operator::I32AtomicRmwXchg { ref memarg } => {
+                let value = state.pop1()?.into_int_value();
+                let effective_address = resolve_memory_ptr(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    &mut state,
+                    &mut ctx,
+                    memarg,
+                    intrinsics.i32_ptr_ty,
+                    4,
+                )?;
+                trap_if_misaligned(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    memarg,
+                    effective_address,
+                );
+                let old = builder
+                    .build_atomicrmw(
+                        AtomicRMWBinOp::Xchg,
+                        effective_address,
+                        value,
+                        AtomicOrdering::SequentiallyConsistent,
+                    )
+                    .unwrap();
+                state.push1(old);
+            }
+            Operator::I64AtomicRmw8UXchg { ref memarg } => {
+                let value = state.pop1()?.into_int_value();
+                let effective_address = resolve_memory_ptr(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    &mut state,
+                    &mut ctx,
+                    memarg,
+                    intrinsics.i8_ptr_ty,
+                    1,
+                )?;
+                trap_if_misaligned(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    memarg,
+                    effective_address,
+                );
+                let narrow_value =
+                    builder.build_int_truncate(value, intrinsics.i8_ty, &state.var_name());
+                let old = builder
+                    .build_atomicrmw(
+                        AtomicRMWBinOp::Xchg,
+                        effective_address,
+                        narrow_value,
+                        AtomicOrdering::SequentiallyConsistent,
+                    )
+                    .unwrap();
+                let old = builder.build_int_z_extend(old, intrinsics.i64_ty, &state.var_name());
+                state.push1(old);
+            }
+            Operator::I64AtomicRmw16UXchg { ref memarg } => {
+                let value = state.pop1()?.into_int_value();
+                let effective_address = resolve_memory_ptr(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    &mut state,
+                    &mut ctx,
+                    memarg,
+                    intrinsics.i16_ptr_ty,
+                    2,
+                )?;
+                trap_if_misaligned(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    memarg,
+                    effective_address,
+                );
+                let narrow_value =
+                    builder.build_int_truncate(value, intrinsics.i16_ty, &state.var_name());
+                let old = builder
+                    .build_atomicrmw(
+                        AtomicRMWBinOp::Xchg,
+                        effective_address,
+                        narrow_value,
+                        AtomicOrdering::SequentiallyConsistent,
+                    )
+                    .unwrap();
+                let old = builder.build_int_z_extend(old, intrinsics.i64_ty, &state.var_name());
+                state.push1(old);
+            }
+            Operator::I64AtomicRmw32UXchg { ref memarg } => {
+                let value = state.pop1()?.into_int_value();
+                let effective_address = resolve_memory_ptr(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    &mut state,
+                    &mut ctx,
+                    memarg,
+                    intrinsics.i32_ptr_ty,
+                    4,
+                )?;
+                trap_if_misaligned(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    memarg,
+                    effective_address,
+                );
+                let narrow_value =
+                    builder.build_int_truncate(value, intrinsics.i32_ty, &state.var_name());
+                let old = builder
+                    .build_atomicrmw(
+                        AtomicRMWBinOp::Xchg,
+                        effective_address,
+                        narrow_value,
+                        AtomicOrdering::SequentiallyConsistent,
+                    )
+                    .unwrap();
+                let old = builder.build_int_z_extend(old, intrinsics.i64_ty, &state.var_name());
+                state.push1(old);
+            }
+            Operator::I64AtomicRmwXchg { ref memarg } => {
+                let value = state.pop1()?.into_int_value();
+                let effective_address = resolve_memory_ptr(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    &mut state,
+                    &mut ctx,
+                    memarg,
+                    intrinsics.i64_ptr_ty,
+                    8,
+                )?;
+                trap_if_misaligned(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    memarg,
+                    effective_address,
+                );
+                let old = builder
+                    .build_atomicrmw(
+                        AtomicRMWBinOp::Xchg,
+                        effective_address,
+                        value,
+                        AtomicOrdering::SequentiallyConsistent,
+                    )
+                    .unwrap();
+                state.push1(old);
+            }
+            Operator::I32AtomicRmw8UCmpxchg { ref memarg } => {
+                let (cmp, new) = state.pop2()?;
+                let (cmp, new) = (cmp.into_int_value(), new.into_int_value());
+                let effective_address = resolve_memory_ptr(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    &mut state,
+                    &mut ctx,
+                    memarg,
+                    intrinsics.i8_ptr_ty,
+                    1,
+                )?;
+                trap_if_misaligned(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    memarg,
+                    effective_address,
+                );
+                let narrow_cmp =
+                    builder.build_int_truncate(cmp, intrinsics.i8_ty, &state.var_name());
+                let narrow_new =
+                    builder.build_int_truncate(new, intrinsics.i8_ty, &state.var_name());
+                let old = builder
+                    .build_cmpxchg(
+                        effective_address,
+                        narrow_cmp,
+                        narrow_new,
+                        AtomicOrdering::SequentiallyConsistent,
+                        AtomicOrdering::SequentiallyConsistent,
+                    )
+                    .unwrap();
+                let old = builder
+                    .build_extract_value(old, 0, "")
+                    .unwrap()
+                    .into_int_value();
+                let old = builder.build_int_z_extend(old, intrinsics.i32_ty, &state.var_name());
+                state.push1(old);
+            }
+            Operator::I32AtomicRmw16UCmpxchg { ref memarg } => {
+                let (cmp, new) = state.pop2()?;
+                let (cmp, new) = (cmp.into_int_value(), new.into_int_value());
+                let effective_address = resolve_memory_ptr(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    &mut state,
+                    &mut ctx,
+                    memarg,
+                    intrinsics.i16_ptr_ty,
+                    2,
+                )?;
+                trap_if_misaligned(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    memarg,
+                    effective_address,
+                );
+                let narrow_cmp =
+                    builder.build_int_truncate(cmp, intrinsics.i16_ty, &state.var_name());
+                let narrow_new =
+                    builder.build_int_truncate(new, intrinsics.i16_ty, &state.var_name());
+                let old = builder
+                    .build_cmpxchg(
+                        effective_address,
+                        narrow_cmp,
+                        narrow_new,
+                        AtomicOrdering::SequentiallyConsistent,
+                        AtomicOrdering::SequentiallyConsistent,
+                    )
+                    .unwrap();
+                let old = builder
+                    .build_extract_value(old, 0, "")
+                    .unwrap()
+                    .into_int_value();
+                let old = builder.build_int_z_extend(old, intrinsics.i32_ty, &state.var_name());
+                state.push1(old);
+            }
+            Operator::I32AtomicRmwCmpxchg { ref memarg } => {
+                let (cmp, new) = state.pop2()?;
+                let (cmp, new) = (cmp.into_int_value(), new.into_int_value());
+                let effective_address = resolve_memory_ptr(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    &mut state,
+                    &mut ctx,
+                    memarg,
+                    intrinsics.i32_ptr_ty,
+                    4,
+                )?;
+                trap_if_misaligned(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    memarg,
+                    effective_address,
+                );
+                let old = builder
+                    .build_cmpxchg(
+                        effective_address,
+                        cmp,
+                        new,
+                        AtomicOrdering::SequentiallyConsistent,
+                        AtomicOrdering::SequentiallyConsistent,
+                    )
+                    .unwrap();
+                let old = builder.build_extract_value(old, 0, "").unwrap();
+                state.push1(old);
+            }
+            Operator::I64AtomicRmw8UCmpxchg { ref memarg } => {
+                let (cmp, new) = state.pop2()?;
+                let (cmp, new) = (cmp.into_int_value(), new.into_int_value());
+                let effective_address = resolve_memory_ptr(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    &mut state,
+                    &mut ctx,
+                    memarg,
+                    intrinsics.i8_ptr_ty,
+                    1,
+                )?;
+                trap_if_misaligned(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    memarg,
+                    effective_address,
+                );
+                let narrow_cmp =
+                    builder.build_int_truncate(cmp, intrinsics.i8_ty, &state.var_name());
+                let narrow_new =
+                    builder.build_int_truncate(new, intrinsics.i8_ty, &state.var_name());
+                let old = builder
+                    .build_cmpxchg(
+                        effective_address,
+                        narrow_cmp,
+                        narrow_new,
+                        AtomicOrdering::SequentiallyConsistent,
+                        AtomicOrdering::SequentiallyConsistent,
+                    )
+                    .unwrap();
+                let old = builder
+                    .build_extract_value(old, 0, "")
+                    .unwrap()
+                    .into_int_value();
+                let old = builder.build_int_z_extend(old, intrinsics.i64_ty, &state.var_name());
+                state.push1(old);
+            }
+            Operator::I64AtomicRmw16UCmpxchg { ref memarg } => {
+                let (cmp, new) = state.pop2()?;
+                let (cmp, new) = (cmp.into_int_value(), new.into_int_value());
+                let effective_address = resolve_memory_ptr(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    &mut state,
+                    &mut ctx,
+                    memarg,
+                    intrinsics.i16_ptr_ty,
+                    2,
+                )?;
+                trap_if_misaligned(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    memarg,
+                    effective_address,
+                );
+                let narrow_cmp =
+                    builder.build_int_truncate(cmp, intrinsics.i16_ty, &state.var_name());
+                let narrow_new =
+                    builder.build_int_truncate(new, intrinsics.i16_ty, &state.var_name());
+                let old = builder
+                    .build_cmpxchg(
+                        effective_address,
+                        narrow_cmp,
+                        narrow_new,
+                        AtomicOrdering::SequentiallyConsistent,
+                        AtomicOrdering::SequentiallyConsistent,
+                    )
+                    .unwrap();
+                let old = builder
+                    .build_extract_value(old, 0, "")
+                    .unwrap()
+                    .into_int_value();
+                let old = builder.build_int_z_extend(old, intrinsics.i64_ty, &state.var_name());
+                state.push1(old);
+            }
+            Operator::I64AtomicRmw32UCmpxchg { ref memarg } => {
+                let (cmp, new) = state.pop2()?;
+                let (cmp, new) = (cmp.into_int_value(), new.into_int_value());
+                let effective_address = resolve_memory_ptr(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    &mut state,
+                    &mut ctx,
+                    memarg,
+                    intrinsics.i32_ptr_ty,
+                    4,
+                )?;
+                trap_if_misaligned(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    memarg,
+                    effective_address,
+                );
+                let narrow_cmp =
+                    builder.build_int_truncate(cmp, intrinsics.i32_ty, &state.var_name());
+                let narrow_new =
+                    builder.build_int_truncate(new, intrinsics.i32_ty, &state.var_name());
+                let old = builder
+                    .build_cmpxchg(
+                        effective_address,
+                        narrow_cmp,
+                        narrow_new,
+                        AtomicOrdering::SequentiallyConsistent,
+                        AtomicOrdering::SequentiallyConsistent,
+                    )
+                    .unwrap();
+                let old = builder
+                    .build_extract_value(old, 0, "")
+                    .unwrap()
+                    .into_int_value();
+                let old = builder.build_int_z_extend(old, intrinsics.i64_ty, &state.var_name());
+                state.push1(old);
+            }
+            Operator::I64AtomicRmwCmpxchg { ref memarg } => {
+                let (cmp, new) = state.pop2()?;
+                let (cmp, new) = (cmp.into_int_value(), new.into_int_value());
+                let effective_address = resolve_memory_ptr(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    &mut state,
+                    &mut ctx,
+                    memarg,
+                    intrinsics.i64_ptr_ty,
+                    8,
+                )?;
+                trap_if_misaligned(
+                    builder,
+                    intrinsics,
+                    context,
+                    &function,
+                    memarg,
+                    effective_address,
+                );
+                let old = builder
+                    .build_cmpxchg(
+                        effective_address,
+                        cmp,
+                        new,
+                        AtomicOrdering::SequentiallyConsistent,
+                        AtomicOrdering::SequentiallyConsistent,
+                    )
+                    .unwrap();
+                let old = builder.build_extract_value(old, 0, "").unwrap();
+                state.push1(old);
+            }
 
             Operator::MemoryGrow { reserved } => {
                 let memory_index = MemoryIndex::new(reserved as usize);
@@ -4430,7 +6844,13 @@ impl FunctionCodeGenerator<CodegenError> for LLVMFunctionCodeGenerator {
                 self.builder.as_ref().unwrap().build_return(None);
             }
             [one_value] => {
-                self.builder.as_ref().unwrap().build_return(Some(one_value));
+                let builder = self.builder.as_ref().unwrap();
+                let intrinsics = self.intrinsics.as_ref().unwrap();
+                builder.build_return(Some(&builder.build_bitcast(
+                    one_value.as_basic_value_enum(),
+                    type_to_llvm_int_only(intrinsics, self.func_sig.returns()[0]),
+                    "return",
+                )));
             }
             _ => unimplemented!("multi-value returns not yet implemented"),
         }
@@ -4475,6 +6895,7 @@ impl ModuleCodeGenerator<LLVMFunctionCodeGenerator, LLVMBackend, CodegenError>
             function_signatures: None,
             func_import_count: 0,
             personality_func,
+            stackmaps: Rc::new(RefCell::new(StackmapRegistry::default())),
         }
     }
 
@@ -4538,14 +6959,26 @@ impl ModuleCodeGenerator<LLVMFunctionCodeGenerator, LLVMBackend, CodegenError>
                 .skip(1)
                 .enumerate()
                 .map(|(index, param)| {
-                    let ty = param.get_type();
+                    //let ty = param.get_type();
+                    let real_ty = func_sig.params()[index];
+                    let real_ty_llvm = type_to_llvm(&intrinsics, real_ty);
 
-                    let alloca = builder.build_alloca(ty, &format!("local{}", index));
-                    builder.build_store(alloca, param);
+                    let alloca = builder.build_alloca(real_ty_llvm, &format!("local{}", index));
+
+                    //if real_ty_llvm != ty {
+                    builder.build_store(
+                        alloca,
+                        builder.build_bitcast(param, real_ty_llvm, &state.var_name()),
+                    );
+                    /*} else {
+                        builder.build_store(alloca, param);
+                    }*/
                     alloca
                 }),
         );
         let num_params = locals.len();
+
+        let local_func_index = self.functions.len();
 
         let code = LLVMFunctionCodeGenerator {
             state,
@@ -4559,6 +6992,9 @@ impl ModuleCodeGenerator<LLVMFunctionCodeGenerator, LLVMBackend, CodegenError>
             num_params,
             ctx: None,
             unreachable_depth: 0,
+            stackmaps: self.stackmaps.clone(),
+            index: local_func_index,
+            opcode_offset: 0,
         };
         self.functions.push(code);
         Ok(self.functions.last_mut().unwrap())
@@ -4593,6 +7029,10 @@ impl ModuleCodeGenerator<LLVMFunctionCodeGenerator, LLVMBackend, CodegenError>
             self.intrinsics.as_ref().unwrap(),
         );
 
+        if let Some(path) = unsafe { &crate::GLOBAL_OPTIONS.pre_opt_ir } {
+            self.module.print_to_file(path).unwrap();
+        }
+
         let pass_manager = PassManager::create(());
         if cfg!(test) {
             pass_manager.add_verifier_pass();
@@ -4612,9 +7052,18 @@ impl ModuleCodeGenerator<LLVMFunctionCodeGenerator, LLVMBackend, CodegenError>
         pass_manager.add_slp_vectorize_pass();
         pass_manager.run_on(&self.module);
 
-        // self.module.print_to_stderr();
+        if let Some(path) = unsafe { &crate::GLOBAL_OPTIONS.post_opt_ir } {
+            self.module.print_to_file(path).unwrap();
+        }
 
-        let (backend, cache_gen) = LLVMBackend::new(self.module, self.intrinsics.take().unwrap());
+        let stackmaps = self.stackmaps.borrow();
+
+        let (backend, cache_gen) = LLVMBackend::new(
+            self.module,
+            self.intrinsics.take().unwrap(),
+            &*stackmaps,
+            module_info,
+        );
         Ok((backend, Box::new(cache_gen)))
     }
 
@@ -4626,6 +7075,7 @@ impl ModuleCodeGenerator<LLVMFunctionCodeGenerator, LLVMBackend, CodegenError>
                     self.context.as_ref().unwrap(),
                     self.intrinsics.as_ref().unwrap(),
                     sig,
+                    type_to_llvm_int_only,
                 )
             })
             .collect();

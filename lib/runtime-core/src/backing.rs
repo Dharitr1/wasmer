@@ -1,5 +1,5 @@
 use crate::{
-    error::{LinkError, LinkResult},
+    error::{CreationError, LinkError, LinkResult},
     export::{Context, Export},
     global::Global,
     import::ImportObject,
@@ -55,19 +55,34 @@ pub struct LocalBacking {
 }
 
 impl LocalBacking {
-    pub(crate) fn new(module: &ModuleInner, imports: &ImportBacking, vmctx: *mut vm::Ctx) -> Self {
-        let mut memories = Self::generate_memories(module);
+    pub(crate) fn new(
+        module: &ModuleInner,
+        imports: &ImportBacking,
+        vmctx: *mut vm::Ctx,
+    ) -> LinkResult<Self> {
+        let mut memories = match Self::generate_memories(module) {
+            Ok(m) => m,
+            Err(e) => {
+                return Err(vec![LinkError::Generic {
+                    message: format!("unable to create memory: {:?}", e),
+                }]);
+            }
+        };
         let mut tables = Self::generate_tables(module);
         let mut globals = Self::generate_globals(module, imports);
 
-        let vm_memories = Self::finalize_memories(module, imports, &mut memories);
-        let vm_tables = Self::finalize_tables(module, imports, &mut tables, vmctx);
+        // Ensure all initializers are valid before running finalizers
+        Self::validate_memories(module, imports)?;
+        Self::validate_tables(module, imports, &mut tables)?;
+
+        let vm_memories = Self::finalize_memories(module, imports, &mut memories)?;
+        let vm_tables = Self::finalize_tables(module, imports, &mut tables, vmctx)?;
         let vm_globals = Self::finalize_globals(&mut globals);
 
         let dynamic_sigindices = Self::generate_sigindices(&module.info);
         let local_functions = Self::generate_local_functions(module);
 
-        Self {
+        Ok(Self {
             memories,
             tables,
             globals,
@@ -80,7 +95,7 @@ impl LocalBacking {
             local_functions,
 
             internals: Internals([0; INTERNALS_SIZE]),
-        }
+        })
     }
 
     fn generate_local_functions(module: &ModuleInner) -> BoxedMap<LocalFuncIndex, *const vm::Func> {
@@ -108,13 +123,67 @@ impl LocalBacking {
             .into_boxed_map()
     }
 
-    fn generate_memories(module: &ModuleInner) -> BoxedMap<LocalMemoryIndex, Memory> {
+    fn generate_memories(
+        module: &ModuleInner,
+    ) -> Result<BoxedMap<LocalMemoryIndex, Memory>, CreationError> {
         let mut memories = Map::with_capacity(module.info.memories.len());
         for (_, &desc) in &module.info.memories {
-            memories.push(Memory::new(desc).expect("unable to create memory"));
+            let memory = Memory::new(desc)?;
+            memories.push(memory);
         }
 
-        memories.into_boxed_map()
+        Ok(memories.into_boxed_map())
+    }
+
+    /// Validate each locally-defined memory in the Module.
+    ///
+    /// This involves copying in the data initializers.
+    fn validate_memories(module: &ModuleInner, imports: &ImportBacking) -> LinkResult<()> {
+        // Validate data size fits
+        for init in module.info.data_initializers.iter() {
+            let init_base = match init.base {
+                Initializer::Const(Value::I32(offset)) => offset as u32,
+                Initializer::Const(_) => {
+                    return Err(vec![LinkError::Generic {
+                        message: "a const initializer must be the i32 type".to_string(),
+                    }]);
+                }
+                Initializer::GetGlobal(import_global_index) => {
+                    if let Value::I32(x) = imports.globals[import_global_index].get() {
+                        x as u32
+                    } else {
+                        return Err(vec![LinkError::Generic {
+                            message: "unsupported global type for initializer".to_string(),
+                        }]);
+                    }
+                }
+            } as usize;
+
+            // Validate data size fits
+            match init.memory_index.local_or_import(&module.info) {
+                LocalOrImport::Local(local_memory_index) => {
+                    let memory_desc = module.info.memories[local_memory_index];
+                    let data_top = init_base + init.data.len();
+                    if memory_desc.minimum.bytes().0 < data_top || data_top < init_base {
+                        return Err(vec![LinkError::Generic {
+                            message: "data segment does not fit".to_string(),
+                        }]);
+                    }
+                }
+                LocalOrImport::Import(imported_memory_index) => {
+                    // Write the initialization data to the memory that
+                    // we think the imported memory is.
+                    let local_memory = unsafe { &*imports.vm_memories[imported_memory_index] };
+                    let data_top = init_base + init.data.len();
+                    if local_memory.bound < data_top || data_top < init_base {
+                        return Err(vec![LinkError::Generic {
+                            message: "data segment does not fit".to_string(),
+                        }]);
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Initialize each locally-defined memory in the Module.
@@ -124,32 +193,30 @@ impl LocalBacking {
         module: &ModuleInner,
         imports: &ImportBacking,
         memories: &mut SliceMap<LocalMemoryIndex, Memory>,
-    ) -> BoxedMap<LocalMemoryIndex, *mut vm::LocalMemory> {
+    ) -> LinkResult<BoxedMap<LocalMemoryIndex, *mut vm::LocalMemory>> {
         // For each init that has some data...
-        for init in module
-            .info
-            .data_initializers
-            .iter()
-            .filter(|init| init.data.len() > 0)
-        {
+        // Initialize data
+        for init in module.info.data_initializers.iter() {
             let init_base = match init.base {
                 Initializer::Const(Value::I32(offset)) => offset as u32,
-                Initializer::Const(_) => panic!("a const initializer must be the i32 type"),
+                Initializer::Const(_) => {
+                    return Err(vec![LinkError::Generic {
+                        message: "a const initializer must be the i32 type".to_string(),
+                    }]);
+                }
                 Initializer::GetGlobal(import_global_index) => {
                     if let Value::I32(x) = imports.globals[import_global_index].get() {
                         x as u32
                     } else {
-                        panic!("unsupported global type for initializer")
+                        return Err(vec![LinkError::Generic {
+                            message: "unsupported global type for initializer".to_string(),
+                        }]);
                     }
                 }
             } as usize;
 
             match init.memory_index.local_or_import(&module.info) {
                 LocalOrImport::Local(local_memory_index) => {
-                    let memory_desc = module.info.memories[local_memory_index];
-                    let data_top = init_base + init.data.len();
-                    assert!(memory_desc.minimum.bytes().0 >= data_top);
-
                     let mem = &memories[local_memory_index];
                     for (mem_byte, data_byte) in mem.view()[init_base..init_base + init.data.len()]
                         .iter()
@@ -161,24 +228,22 @@ impl LocalBacking {
                 LocalOrImport::Import(imported_memory_index) => {
                     // Write the initialization data to the memory that
                     // we think the imported memory is.
-                    unsafe {
+                    let memory_slice = unsafe {
                         let local_memory = &*imports.vm_memories[imported_memory_index];
-                        let memory_slice =
-                            slice::from_raw_parts_mut(local_memory.base, local_memory.bound);
+                        slice::from_raw_parts_mut(local_memory.base, local_memory.bound)
+                    };
 
-                        let mem_init_view =
-                            &mut memory_slice[init_base..init_base + init.data.len()];
-                        mem_init_view.copy_from_slice(&init.data);
-                    }
+                    let mem_init_view = &mut memory_slice[init_base..init_base + init.data.len()];
+                    mem_init_view.copy_from_slice(&init.data);
                 }
             }
         }
 
-        memories
+        Ok(memories
             .iter_mut()
             .map(|(_, mem)| mem.vm_local_memory())
             .collect::<Map<_, _>>()
-            .into_boxed_map()
+            .into_boxed_map())
     }
 
     fn generate_tables(module: &ModuleInner) -> BoxedMap<LocalTableIndex, Table> {
@@ -192,25 +257,28 @@ impl LocalBacking {
         tables.into_boxed_map()
     }
 
-    /// This initializes all of the locally-defined tables in the Module, e.g.
-    /// putting all the table elements (function pointers)
-    /// in the right places.
+    /// This validates all of the locally-defined tables in the Module.
     #[allow(clippy::cast_ptr_alignment)]
-    fn finalize_tables(
+    fn validate_tables(
         module: &ModuleInner,
         imports: &ImportBacking,
         tables: &mut SliceMap<LocalTableIndex, Table>,
-        vmctx: *mut vm::Ctx,
-    ) -> BoxedMap<LocalTableIndex, *mut vm::LocalTable> {
+    ) -> LinkResult<()> {
         for init in &module.info.elem_initializers {
             let init_base = match init.base {
                 Initializer::Const(Value::I32(offset)) => offset as u32,
-                Initializer::Const(_) => panic!("a const initializer must be the i32 type"),
+                Initializer::Const(_) => {
+                    return Err(vec![LinkError::Generic {
+                        message: "a const initializer must be the i32 type".to_string(),
+                    }]);
+                }
                 Initializer::GetGlobal(import_global_index) => {
                     if let Value::I32(x) = imports.globals[import_global_index].get() {
                         x as u32
                     } else {
-                        panic!("unsupported global type for initializer")
+                        return Err(vec![LinkError::Generic {
+                            message: "unsupported global type for initializer".to_string(),
+                        }]);
                     }
                 }
             } as usize;
@@ -220,11 +288,57 @@ impl LocalBacking {
                     let table = &tables[local_table_index];
 
                     if (table.size() as usize) < init_base + init.elements.len() {
-                        let delta = (init_base + init.elements.len()) - table.size() as usize;
-                        // Grow the table if it's too small.
-                        table.grow(delta as u32).expect("couldn't grow table");
+                        return Err(vec![LinkError::Generic {
+                            message: "elements segment does not fit".to_string(),
+                        }]);
                     }
+                }
+                LocalOrImport::Import(import_table_index) => {
+                    let table = &imports.tables[import_table_index];
 
+                    if (table.size() as usize) < init_base + init.elements.len() {
+                        return Err(vec![LinkError::Generic {
+                            message: "elements segment does not fit".to_string(),
+                        }]);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// This initializes all of the locally-defined tables in the Module, e.g.
+    /// putting all the table elements (function pointers)
+    /// in the right places.
+    #[allow(clippy::cast_ptr_alignment)]
+    fn finalize_tables(
+        module: &ModuleInner,
+        imports: &ImportBacking,
+        tables: &mut SliceMap<LocalTableIndex, Table>,
+        vmctx: *mut vm::Ctx,
+    ) -> LinkResult<BoxedMap<LocalTableIndex, *mut vm::LocalTable>> {
+        for init in &module.info.elem_initializers {
+            let init_base = match init.base {
+                Initializer::Const(Value::I32(offset)) => offset as u32,
+                Initializer::Const(_) => {
+                    return Err(vec![LinkError::Generic {
+                        message: "a const initializer must be the i32 type".to_string(),
+                    }]);
+                }
+                Initializer::GetGlobal(import_global_index) => {
+                    if let Value::I32(x) = imports.globals[import_global_index].get() {
+                        x as u32
+                    } else {
+                        return Err(vec![LinkError::Generic {
+                            message: "unsupported global type for initializer".to_string(),
+                        }]);
+                    }
+                }
+            } as usize;
+
+            match init.table_index.local_or_import(&module.info) {
+                LocalOrImport::Local(local_table_index) => {
+                    let table = &tables[local_table_index];
                     table.anyfunc_direct_access_mut(|elements| {
                         for (i, &func_index) in init.elements.iter().enumerate() {
                             let sig_index = module.info.func_assoc[func_index];
@@ -258,12 +372,6 @@ impl LocalBacking {
                 LocalOrImport::Import(import_table_index) => {
                     let table = &imports.tables[import_table_index];
 
-                    if (table.size() as usize) < init_base + init.elements.len() {
-                        let delta = (init_base + init.elements.len()) - table.size() as usize;
-                        // Grow the table if it's too small.
-                        table.grow(delta as u32).expect("couldn't grow table");
-                    }
-
                     table.anyfunc_direct_access_mut(|elements| {
                         for (i, &func_index) in init.elements.iter().enumerate() {
                             let sig_index = module.info.func_assoc[func_index];
@@ -297,11 +405,11 @@ impl LocalBacking {
             }
         }
 
-        tables
+        Ok(tables
             .iter_mut()
             .map(|(_, table)| table.vm_local_table())
             .collect::<Map<_, _>>()
-            .into_boxed_map()
+            .into_boxed_map())
     }
 
     fn generate_globals(

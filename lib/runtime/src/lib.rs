@@ -1,4 +1,14 @@
-#![deny(unused_imports, unused_variables, unused_unsafe, unreachable_patterns)]
+#![deny(
+    dead_code,
+    nonstandard_style,
+    unused_imports,
+    unused_mut,
+    unused_variables,
+    unused_unsafe,
+    unreachable_patterns
+)]
+#![doc(html_favicon_url = "https://wasmer.io/static/icons/favicon.ico")]
+#![doc(html_logo_url = "https://avatars3.githubusercontent.com/u/44205449?s=200&v=4")]
 
 //! Wasmer-runtime is a library that makes embedding WebAssembly
 //! in your application easy, efficient, and safe.
@@ -93,7 +103,7 @@ pub use wasmer_runtime_core::{compile_with, validate};
 pub use wasmer_runtime_core::{func, imports};
 
 pub mod memory {
-    pub use wasmer_runtime_core::memory::{Atomic, Atomically, Memory, MemoryView};
+    pub use wasmer_runtime_core::memory::{Atomically, Memory, MemoryView};
 }
 
 pub mod wasm {

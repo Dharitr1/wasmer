@@ -1,5 +1,15 @@
-#![deny(unused_imports, unused_variables, unused_unsafe, unreachable_patterns)]
+#![deny(
+    dead_code,
+    nonstandard_style,
+    unused_imports,
+    unused_mut,
+    unused_variables,
+    unused_unsafe,
+    unreachable_patterns
+)]
 #![feature(proc_macro_hygiene)]
+#![doc(html_favicon_url = "https://wasmer.io/static/icons/favicon.ico")]
+#![doc(html_logo_url = "https://avatars3.githubusercontent.com/u/44205449?s=200&v=4")]
 
 #[cfg(not(any(
     all(target_os = "macos", target_arch = "x86_64"),
