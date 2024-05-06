@@ -986,7 +986,7 @@ dependencies = [
 
 [[package]]
 name = "wasmer"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "byteorder",
  "console",
@@ -1009,21 +1009,21 @@ dependencies = [
  "target-lexicon",
  "tempdir",
  "wabt",
- "wasmparser 0.20.0",
+ "wasmparser 0.23.0",
  "winapi",
 ]
-
-[[package]]
-name = "wasmparser"
-version = "0.20.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2a75e0c3fe9a4d4fd91901348a5be05ba4791e29dda89e8596bfe87900ba7edc"
 
 [[package]]
 name = "wasmparser"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f46e666ecb4a406483a59a49f9d0c17f327e70da53a128eccddae2eadb95865c"
+
+[[package]]
+name = "wasmparser"
+version = "0.23.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b5e01c420bc7d36e778bd242e1167b079562ba8b34087122cc9057187026d060"
 
 [[package]]
 name = "winapi"
