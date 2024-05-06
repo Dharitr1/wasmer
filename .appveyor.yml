@@ -1,0 +1,50 @@
+version: "{build} ~ {branch}"
+
+os: Visual Studio 2017
+
+# Do not build feature branch with open Pull Requests
+skip_branch_with_pr: true
+
+environment:
+  matrix:
+    - CHANNEL: stable
+      ARCH: x86_64
+      ABI: msvc
+      TARGET: x86_64-pc-windows-msvc
+
+cache:
+  - 'C:\Users\appveyor\.cargo'
+
+install:
+  - appveyor DownloadFile https://win.rustup.rs/ -FileName rustup-init.exe
+  - rustup-init.exe -yv --default-host %target%
+  - set PATH=%PATH%;%USERPROFILE%\.cargo\bin
+  - rustc -vV
+  - cargo -vV
+
+build_script:
+  - cargo build --verbose
+
+test_script:
+  - set RUST_BACKTRACE=1
+  - cd ./lib/spectests && cargo test -- --test-threads 1 && cd ../..
+
+before_deploy:
+  - cd ./src/installer
+  - iscc wasmer.iss
+  - copy /y .\WasmerInstaller.exe ..\..\WasmerInstaller-%APPVEYOR_REPO_TAG_NAME%.exe
+  - appveyor PushArtifact WasmerInstaller-%APPVEYOR_REPO_TAG_NAME%.exe
+
+artifacts:
+  - path: WasmerInstaller-%APPVEYOR_REPO_TAG_NAME%.exe
+    name: WasmerInstaller.exe
+
+deploy:
+  description: 'WasmerInstaller'
+  artifact: /.*\.exe/
+  auth_token:
+    secure: CaKtncy7S1PWxzDUQ0p2264pe3HwxzDn5VIyRizDaa72/SVfskNcoMjwwRh0ut22
+  provider: GitHub
+  on:
+    branch: master
+    appveyor_repo_tag: true
