@@ -34,8 +34,9 @@ precommit: lint test
 
 build-install:
 	mkdir -p ./install/bin
+	cp ./wapm-cli/target/release/wapm ./install/bin/
 	cp ./target/release/wasmer ./install/bin/
-	tar -C ./install -zcvf wasmer.tar.gz bin/wasmer
+	tar -C ./install -zcvf wasmer.tar.gz bin/wapm bin/wasmer
 
 # For installing the contents locally
 do-install:
@@ -63,13 +64,13 @@ test-emscripten-singlepass:
 	cargo test --manifest-path lib/emscripten/Cargo.toml --features singlepass -- --test-threads=1 $(runargs)
 
 singlepass-debug-release:
-	cargo +nightly build --features "singlepass debug" --release
+	cargo +nightly build --features "backend:singlepass debug" --release
 
 singlepass-release:
-	cargo +nightly build --features "singlepass" --release
+	cargo +nightly build --features "backend:singlepass" --release
 
 singlepass-build:
-	cargo +nightly build --features "singlepass debug"
+	cargo +nightly build --features "backend:singlepass debug"
 
 release:
 	# If you are in OS-X, you will need mingw-w64 for cross compiling to windows

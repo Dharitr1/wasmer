@@ -17,7 +17,17 @@ pub use self::utils::is_wasi_module;
 
 use wasmer_runtime_core::{func, import::ImportObject, imports};
 
-pub fn generate_import_object(args: Vec<Vec<u8>>, envs: Vec<Vec<u8>>) -> ImportObject {
+/// This is returned in the Box<dyn Any> RuntimeError::Error variant.
+/// Use `downcast` or `downcast_ref` to retrieve the `ExitCode`.
+pub struct ExitCode {
+    pub code: syscalls::types::__wasi_exitcode_t,
+}
+
+pub fn generate_import_object(
+    args: Vec<Vec<u8>>,
+    envs: Vec<Vec<u8>>,
+    preopened_files: Vec<String>,
+) -> ImportObject {
     let state_gen = move || {
         fn state_destructor(data: *mut c_void) {
             unsafe {
@@ -26,7 +36,7 @@ pub fn generate_import_object(args: Vec<Vec<u8>>, envs: Vec<Vec<u8>>) -> ImportO
         }
 
         let state = Box::new(WasiState {
-            fs: WasiFs::new().unwrap(),
+            fs: WasiFs::new(&preopened_files).unwrap(),
             args: &args[..],
             envs: &envs[..],
         });
