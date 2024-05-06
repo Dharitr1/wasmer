@@ -48,7 +48,7 @@ impl WasmHash {
         let mut state = blake2bp::State::new();
         state.update(wasm);
 
-        let mut hasher = state.finalize();
+        let hasher = state.finalize();
         let generic_array = hasher.as_bytes();
 
         first_part.copy_from_slice(&generic_array[0..32]);
@@ -207,3 +207,7 @@ pub trait Cache {
     fn load(&self, key: WasmHash) -> Result<Module, Self::LoadError>;
     fn store(&mut self, key: WasmHash, module: Module) -> Result<(), Self::StoreError>;
 }
+
+/// A unique ID generated from the version of Wasmer for use with cache versioning
+pub const WASMER_VERSION_HASH: &'static str =
+    include_str!(concat!(env!("OUT_DIR"), "/wasmer_version_hash.txt"));

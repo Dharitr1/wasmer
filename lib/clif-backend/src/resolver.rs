@@ -94,7 +94,6 @@ impl FuncResolverBuilder {
         info: &ModuleInfo,
     ) -> CompileResult<(Self, HandlerData)> {
         let num_func_bodies = function_bodies.len();
-        let mut compiled_functions: Vec<(Vec<u8>, RelocSink)> = Vec::with_capacity(num_func_bodies);
         let mut local_relocs = Map::with_capacity(num_func_bodies);
         let mut external_relocs = Map::with_capacity(num_func_bodies);
 
@@ -222,7 +221,7 @@ impl FuncResolverBuilder {
 
     pub fn finalize(
         mut self,
-        signatures: &SliceMap<SigIndex, Arc<FuncSig>>,
+        signatures: &SliceMap<SigIndex, FuncSig>,
         trampolines: Arc<Trampolines>,
         handler_data: HandlerData,
     ) -> CompileResult<(FuncResolver, BackendCache)> {
@@ -289,8 +288,8 @@ impl FuncResolverBuilder {
                         },
                     },
                     RelocationType::Signature(sig_index) => {
-                        let sig_index =
-                            SigRegistry.lookup_sig_index(Arc::clone(&signatures[sig_index]));
+                        let signature = SigRegistry.lookup_signature_ref(&signatures[sig_index]);
+                        let sig_index = SigRegistry.lookup_sig_index(signature);
                         sig_index.index() as _
                     }
                 };
@@ -375,20 +374,26 @@ fn round_up(n: usize, multiple: usize) -> usize {
 }
 
 extern "C" fn i32_print(_ctx: &mut vm::Ctx, n: i32) {
-    print!(" i32: {},", n);
+    eprint!(" i32: {},", n);
 }
 extern "C" fn i64_print(_ctx: &mut vm::Ctx, n: i64) {
-    print!(" i64: {},", n);
+    eprint!(" i64: {},", n);
 }
 extern "C" fn f32_print(_ctx: &mut vm::Ctx, n: f32) {
-    print!(" f32: {},", n);
+    eprint!(" f32: {},", n);
 }
 extern "C" fn f64_print(_ctx: &mut vm::Ctx, n: f64) {
-    print!(" f64: {},", n);
+    eprint!(" f64: {},", n);
 }
-extern "C" fn start_debug(_ctx: &mut vm::Ctx, func_index: u32) {
-    print!("func ({}), args: [", func_index);
+extern "C" fn start_debug(ctx: &mut vm::Ctx, func_index: u32) {
+    if let Some(symbol_map) = unsafe { ctx.borrow_symbol_map() } {
+        if let Some(fn_name) = symbol_map.get(&func_index) {
+            eprint!("func ({} ({})), args: [", fn_name, func_index);
+            return;
+        }
+    }
+    eprint!("func ({}), args: [", func_index);
 }
 extern "C" fn end_debug(_ctx: &mut vm::Ctx) {
-    println!(" ]");
+    eprintln!(" ]");
 }
