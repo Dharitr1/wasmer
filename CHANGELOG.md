@@ -6,6 +6,14 @@ Blocks of changes will separated by version increments.
 
 ## **[Unreleased]**
 
+## 0.5.7
+- [#575](https://github.com/wasmerio/wasmer/pull/575) Prepare for release; update wapm to 0.3.6
+- [#555](https://github.com/wasmerio/wasmer/pull/555) WASI filesystem rewrite.  Major improvements
+  - adds virtual root showing all preopened directories
+  - improved sandboxing and code-reuse
+  - symlinks work in a lot more situations
+  - many misc. improvements to most syscalls touching the filesystem
+
 ## 0.5.6
 - [#565](https://github.com/wasmerio/wasmer/pull/565) Update wapm and bump version to 0.5.6
 - [#563](https://github.com/wasmerio/wasmer/pull/563) Improve wasi testing infrastructure
