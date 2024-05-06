@@ -75,16 +75,24 @@ public:
     }
 
     virtual void registerEHFrames(uint8_t* addr, uint64_t LoadAddr, size_t size) override {
+        // We don't know yet how to do this on Windows, so we hide this on compilation
+        // so we can compile and pass spectests on unix systems
+        #ifndef _WIN32
         eh_frame_ptr = addr;
         eh_frame_size = size;
         eh_frames_registered = true;
         callbacks.visit_fde(addr, size, __register_frame);
+        #endif
     }
 
     virtual void deregisterEHFrames() override {
+        // We don't know yet how to do this on Windows, so we hide this on compilation
+        // so we can compile and pass spectests on unix systems
+        #ifndef _WIN32
         if (eh_frames_registered) {
             callbacks.visit_fde(eh_frame_ptr, eh_frame_size, __deregister_frame);
         }
+        #endif
     }
 
     virtual bool finalizeMemory(std::string *ErrMsg = nullptr) override {
@@ -139,24 +147,19 @@ struct SymbolLookup : llvm::JITSymbolResolver {
 public:
     SymbolLookup(callbacks_t callbacks) : callbacks(callbacks) {}
 
-    virtual llvm::Expected<LookupResult> lookup(const LookupSet& symbols) override {
+    void lookup(const LookupSet& symbols, OnResolvedFunction OnResolved) {
         LookupResult result;
 
         for (auto symbol : symbols) {
             result.emplace(symbol, symbol_lookup(symbol));
         }
 
-        return result;
+        OnResolved(result);
     }
 
-    virtual llvm::Expected<LookupFlagsResult> lookupFlags(const LookupSet& symbols) override {
-        LookupFlagsResult result;
-
-        for (auto symbol : symbols) {
-            result.emplace(symbol, symbol_lookup(symbol).getFlags());
-        }
-
-        return result;
+    llvm::Expected<LookupSet> getResponsibilitySet(const LookupSet &Symbols) {
+        const std::set<llvm::StringRef> empty;
+        return empty;
     }
 
 private:
