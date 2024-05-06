@@ -1,6 +1,6 @@
 use super::super::host;
 /// NOTE: These syscalls only support wasm_32 for now because they take u32 offset
-use libc::{c_int, getgrnam as libc_getgrnam, getpwnam as libc_getpwnam, c_long, sysconf};
+use libc::{c_int, c_long, getenv, getgrnam as libc_getgrnam, getpwnam as libc_getpwnam, sysconf};
 use std::ffi::CStr;
 use std::mem;
 use std::os::raw::c_char;
@@ -8,19 +8,21 @@ use std::os::raw::c_char;
 use super::utils::{copy_cstr_into_wasm, copy_terminated_array_of_cstrs};
 use crate::webassembly::Instance;
 
-/// emscripten: _getenv
-pub extern "C" fn _getenv(name_ptr: c_int, instance: &mut Instance) -> c_int {
-    debug!("emscripten::_getenv {}", name_ptr);
-    let name = unsafe {
-        let memory_name_ptr = instance.memory_offset_addr(0, name_ptr as usize) as *const c_char;
-        CStr::from_ptr(memory_name_ptr).to_str().unwrap()
-    };
-    match host::get_env(name, instance) {
-        Ok(_) => {
-            unimplemented!();
-        }
-        Err(_) => 0,
+// #[no_mangle]
+/// emscripten: _getenv // (name: *const char) -> *const c_char;
+pub extern "C" fn _getenv(name: c_int, instance: &mut Instance) -> u32 {
+    debug!("emscripten::_getenv");
+
+    let name_addr = instance.memory_offset_addr(0, name as usize) as *const c_char;
+
+    debug!("=> name({:?})", unsafe { CStr::from_ptr(name_addr) });
+
+    let c_str = unsafe { getenv(name_addr) };
+    if c_str.is_null() {
+        return 0;
     }
+
+    unsafe { copy_cstr_into_wasm(instance, c_str) }
 }
 
 pub extern "C" fn _getpwnam(name_ptr: c_int, instance: &mut Instance) -> c_int {
@@ -97,11 +99,6 @@ pub extern "C" fn _getgrnam(name_ptr: c_int, instance: &mut Instance) -> c_int {
     }
 }
 
-pub extern "C" fn _localtime_r() -> u32 {
-    debug!("emscripten::_localtime_r");
-    0
-}
-
 pub extern "C" fn _getpagesize() -> u32 {
     debug!("emscripten::_getpagesize");
     16384
@@ -111,10 +108,8 @@ pub extern "C" fn ___build_environment(environ: c_int) {
     debug!("emscripten::___build_environment {}", environ);
 }
 
-pub extern "C" fn _sysconf(name: c_int, instance: &mut Instance) -> c_long {
+pub extern "C" fn _sysconf(name: c_int, _instance: &mut Instance) -> c_long {
     debug!("emscripten::_sysconf {}", name);
     // TODO: Implement like emscripten expects regarding memory/page size
-    unsafe {
-        sysconf(name)
-    }
+    unsafe { sysconf(name) }
 }
