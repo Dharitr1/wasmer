@@ -6,6 +6,14 @@ Blocks of changes will separated by version increments.
 
 ## **[Unreleased]**
 
+## 0.5.2 - 2019-07-02
+- [#521](https://github.com/wasmerio/wasmer/pull/521) Update Wapm-cli, bump version numbers
+- [#518](https://github.com/wasmerio/wasmer/pull/518) Update Cranelift and WasmParser
+- [#514](https://github.com/wasmerio/wasmer/pull/514) [#519](https://github.com/wasmerio/wasmer/pull/519) Improved Emscripten network related calls, added a null check to `WasmPtr`
+- [#515](https://github.com/wasmerio/wasmer/pull/515) Improved Emscripten dyncalls
+- [#513](https://github.com/wasmerio/wasmer/pull/513) Fix emscripten lseek implementation.
+- [#510](https://github.com/wasmerio/wasmer/pull/510) Simplify construction of floating point constants in LLVM backend. Fix LLVM assertion failure due to definition of %ctx.
+
 ## 0.5.1 - 2019-06-24
 - [#508](https://github.com/wasmerio/wasmer/pull/508) Update wapm version, includes bug fixes
 
