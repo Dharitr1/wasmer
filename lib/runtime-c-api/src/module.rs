@@ -3,13 +3,15 @@
 use crate::{
     error::{update_last_error, CApiError},
     export::wasmer_import_export_kind,
-    import::wasmer_import_t,
+    import::{wasmer_import_object_t, wasmer_import_t},
     instance::wasmer_instance_t,
     wasmer_byte_array, wasmer_result_t,
 };
 use libc::c_int;
 use std::{collections::HashMap, slice};
-use wasmer_runtime::{compile, default_compiler, Global, ImportObject, Memory, Module, Table};
+use wasmer_runtime::{
+    compile, default_compiler, Global, ImportObject, Instance, Memory, Module, Table,
+};
 use wasmer_runtime_core::{cache::Artifact, export::Export, import::Namespace, load_cache_with};
 
 #[repr(C)]
@@ -32,6 +34,7 @@ pub unsafe extern "C" fn wasmer_compile(
     wasm_bytes_len: u32,
 ) -> wasmer_result_t {
     let bytes: &[u8] = slice::from_raw_parts_mut(wasm_bytes, wasm_bytes_len as usize);
+    // TODO: this implicitly uses default_compiler() is that proper? a better way to handle metering?
     let result = compile(bytes);
     let new_module = match result {
         Ok(instance) => instance,
@@ -44,13 +47,26 @@ pub unsafe extern "C" fn wasmer_compile(
     wasmer_result_t::WASMER_OK
 }
 
-/// Returns true for valid wasm bytes and false for invalid bytes
+/// Validates a sequence of bytes hoping it represents a valid WebAssembly module.
+///
+/// The function returns true if the bytes are valid, false otherwise.
+///
+/// Example:
+///
+/// ```c
+/// bool result = wasmer_validate(bytes, bytes_length);
+///
+/// if (false == result) {
+///     // Do something…
+/// }
+/// ```
 #[allow(clippy::cast_ptr_alignment)]
 #[no_mangle]
 pub unsafe extern "C" fn wasmer_validate(wasm_bytes: *const u8, wasm_bytes_len: u32) -> bool {
     if wasm_bytes.is_null() {
         return false;
     }
+
     let bytes: &[u8] = slice::from_raw_parts(wasm_bytes, wasm_bytes_len as usize);
 
     wasmer_runtime_core::validate(bytes)
@@ -136,6 +152,32 @@ pub unsafe extern "C" fn wasmer_module_instantiate(
 
     *instance = Box::into_raw(Box::new(new_instance)) as *mut wasmer_instance_t;
     wasmer_result_t::WASMER_OK
+}
+
+/// Given:
+/// * A prepared `wasmer` import-object
+/// * A compiled wasmer module
+///
+/// Instantiates a wasmer instance
+#[no_mangle]
+pub unsafe extern "C" fn wasmer_module_import_instantiate(
+    instance: *mut *mut wasmer_instance_t,
+    module: *const wasmer_module_t,
+    import_object: *const wasmer_import_object_t,
+) -> wasmer_result_t {
+    let import_object: &ImportObject = &*(import_object as *const ImportObject);
+    let module: &Module = &*(module as *const Module);
+
+    let new_instance: Instance = match module.instantiate(import_object) {
+        Ok(instance) => instance,
+        Err(error) => {
+            update_last_error(error);
+            return wasmer_result_t::WASMER_ERROR;
+        }
+    };
+    *instance = Box::into_raw(Box::new(new_instance)) as *mut wasmer_instance_t;
+
+    return wasmer_result_t::WASMER_OK;
 }
 
 /// Serialize the given Module.
@@ -244,6 +286,7 @@ pub unsafe extern "C" fn wasmer_module_deserialize(
     let serialized_module: &[u8] = &*(serialized_module as *const &[u8]);
 
     match Artifact::deserialize(serialized_module) {
+        // TODO: we need to use a different call here to support middleware (or modify wasmer-runtime)
         Ok(artifact) => match load_cache_with(artifact, &default_compiler()) {
             Ok(deserialized_module) => {
                 *module = Box::into_raw(Box::new(deserialized_module)) as _;

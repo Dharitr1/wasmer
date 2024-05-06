@@ -1,31 +1,31 @@
 <p align="center">
   <a href="https://wasmer.io" target="_blank" rel="noopener noreferrer">
-    <img width="400" src="https://raw.githubusercontent.com/wasmerio/wasmer/master/logo.png" alt="Wasmer logo">
+    <img width="300" src="https://raw.githubusercontent.com/wasmerio/wasmer/master/assets/logo.png" alt="Wasmer logo">
   </a>
 </p>
 
 <p align="center">
-  <a href="https://circleci.com/gh/wasmerio/wasmer/">
-    <img src="https://img.shields.io/circleci/project/github/wasmerio/wasmer/master.svg" alt="Build Status">
+  <a href="https://dev.azure.com/wasmerio/wasmer/_build/latest?definitionId=3&branchName=master">
+    <img src="https://img.shields.io/azure-devops/build/wasmerio/wasmer/3.svg?style=flat-square" alt="Build Status">
   </a>
   <a href="https://github.com/wasmerio/wasmer/blob/master/LICENSE">
-    <img src="https://img.shields.io/github/license/wasmerio/wasmer.svg" alt="License">
+    <img src="https://img.shields.io/github/license/wasmerio/wasmer.svg?style=flat-square" alt="License">
   </a>
   <a href="https://spectrum.chat/wasmer">
     <img src="https://withspectrum.github.io/badge/badge.svg" alt="Join the Wasmer Community">
   </a>
   <a href="https://crates.io/crates/wasmer-runtime-c-api">
-    <img src="https://img.shields.io/crates/d/wasmer-runtime-c-api.svg" alt="Number of downloads from crates.io">
+    <img src="https://img.shields.io/crates/d/wasmer-runtime-c-api.svg?style=flat-square" alt="Number of downloads from crates.io">
   </a>
-  <a href="https://docs.rs/wasmer-runtime-c-api">
-    <img src="https://docs.rs/wasmer-runtime-c-api/badge.svg" alt="Read our API documentation">
+  <a href="https://wasmerio.github.io/wasmer/c/runtime-c-api/">
+    <img src="https://img.shields.io/badge/Docs-Wasmer%20C%20API-blue?style=flat-square" alt="Wasmer C API Documentation">
   </a>
 </p>
 
 # Wasmer Runtime C API
 
 Wasmer is a standalone JIT WebAssembly runtime, aiming to be fully
-compatible with Emscripten, Rust and Go. [Learn
+compatible with WASI, Emscripten, Rust and Go. [Learn
 more](https://github.com/wasmerio/wasmer).
 
 This crate exposes a C and a C++ API for the Wasmer runtime.
@@ -36,6 +36,10 @@ The C and C++ header files can be found in the source tree of this
 crate, respectively [`wasmer.h`][wasmer_h] and
 [`wasmer.hh`][wasmer_hh]. They are automatically generated, and always
 up-to-date in this repository.
+The runtime shared library (so, dll, dylib) can also be downloaded in Wasmer [release page](https://github.com/wasmerio/wasmer/releases).
+
+You can find the full C API documentation here:
+https://wasmerio.github.io/wasmer/c/runtime-c-api/
 
 Here is a simple example to use the C API:
 
@@ -104,10 +108,14 @@ int main()
 
 # Testing
 
+Tests are run using the release build of the library.  If you make
+changes or compile with non-default features, please ensure you
+rebuild in release mode for the tests to see the changes.
+
 The tests can be run via `cargo test`, such as:
 
 ```sh
-$ cargo test -- --nocapture
+$ cargo test --release -- --nocapture
 ```
 
 To run tests manually, enter the `lib/runtime-c-api/tests` directory
@@ -119,6 +127,31 @@ $ make
 $ make test
 ```
 
+# Feature Flags
+
+By default this uses the cranelift compiler. You can enable a different compiler
+by using feature flags. However, make sure to disable default features, as exactly
+one default compiler must be enabled.
+
+LLVM: `cargo build --no-default-features --features llvm-backend`
+single-pass: `cargo build --no-default-features --features singlepass-backend`
+
+Note that the single-pass backend 
+[does not currently support serialization](https://github.com/wasmerio/wasmer/issues/811),
+so the serialization related tests will fail there.
+
+There is also a flag to enable gas metering which provides three new api endpoints:
+
+These are replaced with stubs of a normal compiler if the metering flag is not provided, 
+to provide a consistent API and not break upstream packages at link time.
+
+Note that the gas metering middleware is 
+[not currently compatible with the cranelift backend](https://github.com/wasmerio/wasmer/issues/819),
+so you must select a different backend (see above) if you enable metering.eg
+
+`cargo build --no-default-features --features llvm-backend,metering`
+
+Once that issue is resolved, `cargo build --features metering` will give you a useful binary.
 
 # License
 

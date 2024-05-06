@@ -8,6 +8,7 @@ use crate::{
     sig_registry::SigRegistry,
     structures::{BoxedMap, Map, SliceMap, TypedIndex},
     table::Table,
+    typed_func::{always_trap, Func},
     types::{
         ImportedFuncIndex, ImportedGlobalIndex, ImportedMemoryIndex, ImportedTableIndex,
         Initializer, LocalFuncIndex, LocalGlobalIndex, LocalMemoryIndex, LocalOrImport,
@@ -15,8 +16,9 @@ use crate::{
     },
     vm,
 };
-use std::{fmt::Debug, slice};
+use std::{fmt::Debug, ptr::NonNull, slice};
 
+/// Size of the array for internal instance usage
 pub const INTERNALS_SIZE: usize = 256;
 
 pub(crate) struct Internals(pub(crate) [u64; INTERNALS_SIZE]);
@@ -54,6 +56,9 @@ pub struct LocalBacking {
     pub(crate) internals: Internals,
 }
 
+// Manually implemented because LocalBacking contains raw pointers directly
+unsafe impl Send for LocalBacking {}
+
 impl LocalBacking {
     pub(crate) fn new(
         module: &ModuleInner,
@@ -69,7 +74,7 @@ impl LocalBacking {
             }
         };
         let mut tables = Self::generate_tables(module);
-        let mut globals = Self::generate_globals(module, imports);
+        let mut globals = Self::generate_globals(module, imports)?;
 
         // Ensure all initializers are valid before running finalizers
         Self::validate_memories(module, imports)?;
@@ -145,10 +150,15 @@ impl LocalBacking {
                 Initializer::Const(Value::I32(offset)) => offset as u32,
                 Initializer::Const(_) => {
                     return Err(vec![LinkError::Generic {
-                        message: "a const initializer must be the i32 type".to_string(),
+                        message: "a const initializer must be an i32".to_string(),
                     }]);
                 }
                 Initializer::GetGlobal(import_global_index) => {
+                    if import_global_index.index() >= imports.globals.len() {
+                        return Err(vec![LinkError::Generic {
+                            message: "incorrect global index for initializer".to_string(),
+                        }]);
+                    }
                     if let Value::I32(x) = imports.globals[import_global_index].get() {
                         x as u32
                     } else {
@@ -201,10 +211,15 @@ impl LocalBacking {
                 Initializer::Const(Value::I32(offset)) => offset as u32,
                 Initializer::Const(_) => {
                     return Err(vec![LinkError::Generic {
-                        message: "a const initializer must be the i32 type".to_string(),
+                        message: "a const initializer must be an i32".to_string(),
                     }]);
                 }
                 Initializer::GetGlobal(import_global_index) => {
+                    if import_global_index.index() >= imports.globals.len() {
+                        return Err(vec![LinkError::Generic {
+                            message: "incorrect global index for initializer".to_string(),
+                        }]);
+                    }
                     if let Value::I32(x) = imports.globals[import_global_index].get() {
                         x as u32
                     } else {
@@ -269,10 +284,15 @@ impl LocalBacking {
                 Initializer::Const(Value::I32(offset)) => offset as u32,
                 Initializer::Const(_) => {
                     return Err(vec![LinkError::Generic {
-                        message: "a const initializer must be the i32 type".to_string(),
+                        message: "a const initializer must be an i32".to_string(),
                     }]);
                 }
                 Initializer::GetGlobal(import_global_index) => {
+                    if import_global_index.index() >= imports.globals.len() {
+                        return Err(vec![LinkError::Generic {
+                            message: "incorrect global index for initializer".to_string(),
+                        }]);
+                    }
                     if let Value::I32(x) = imports.globals[import_global_index].get() {
                         x as u32
                     } else {
@@ -322,10 +342,15 @@ impl LocalBacking {
                 Initializer::Const(Value::I32(offset)) => offset as u32,
                 Initializer::Const(_) => {
                     return Err(vec![LinkError::Generic {
-                        message: "a const initializer must be the i32 type".to_string(),
+                        message: "a const initializer be an i32".to_string(),
                     }]);
                 }
                 Initializer::GetGlobal(import_global_index) => {
+                    if import_global_index.index() >= imports.globals.len() {
+                        return Err(vec![LinkError::Generic {
+                            message: "incorrect global index for initializer".to_string(),
+                        }]);
+                    }
                     if let Value::I32(x) = imports.globals[import_global_index].get() {
                         x as u32
                     } else {
@@ -359,9 +384,9 @@ impl LocalBacking {
                                     vmctx,
                                 ),
                                 LocalOrImport::Import(imported_func_index) => {
-                                    let vm::ImportedFunc { func, vmctx } =
+                                    let vm::ImportedFunc { func, func_ctx } =
                                         imports.vm_functions[imported_func_index];
-                                    (func, vmctx)
+                                    (func, unsafe { func_ctx.as_ref() }.vmctx.as_ptr())
                                 }
                             };
 
@@ -392,9 +417,9 @@ impl LocalBacking {
                                     vmctx,
                                 ),
                                 LocalOrImport::Import(imported_func_index) => {
-                                    let vm::ImportedFunc { func, vmctx } =
+                                    let vm::ImportedFunc { func, func_ctx } =
                                         imports.vm_functions[imported_func_index];
-                                    (func, vmctx)
+                                    (func, unsafe { func_ctx.as_ref() }.vmctx.as_ptr())
                                 }
                             };
 
@@ -415,13 +440,22 @@ impl LocalBacking {
     fn generate_globals(
         module: &ModuleInner,
         imports: &ImportBacking,
-    ) -> BoxedMap<LocalGlobalIndex, Global> {
+    ) -> LinkResult<BoxedMap<LocalGlobalIndex, Global>> {
         let mut globals = Map::with_capacity(module.info.globals.len());
 
         for (_, global_init) in module.info.globals.iter() {
             let value = match &global_init.init {
                 Initializer::Const(value) => value.clone(),
                 Initializer::GetGlobal(import_global_index) => {
+                    if imports.globals.len() <= import_global_index.index() {
+                        return Err(vec![LinkError::Generic {
+                            message: format!(
+                                "Trying to read the `{:?}` global that is not properly initialized.",
+                                import_global_index.index()
+                            ),
+                        }]);
+                    }
+
                     imports.globals[*import_global_index].get()
                 }
             };
@@ -435,7 +469,7 @@ impl LocalBacking {
             globals.push(global);
         }
 
-        globals.into_boxed_map()
+        Ok(globals.into_boxed_map())
     }
 
     fn finalize_globals(
@@ -449,6 +483,8 @@ impl LocalBacking {
     }
 }
 
+/// The `ImportBacking` stores references to the imported resources of an Instance. This includes
+/// imported memories, tables, globals and functions.
 #[derive(Debug)]
 pub struct ImportBacking {
     pub(crate) memories: BoxedMap<ImportedMemoryIndex, Memory>,
@@ -461,7 +497,11 @@ pub struct ImportBacking {
     pub(crate) vm_globals: BoxedMap<ImportedGlobalIndex, *mut vm::LocalGlobal>,
 }
 
+// manually implemented because ImportBacking contains raw pointers directly
+unsafe impl Send for ImportBacking {}
+
 impl ImportBacking {
+    /// Creates a new `ImportBacking` from the given `ModuleInner`, `ImportObject`, and `Ctx`.
     pub fn new(
         module: &ModuleInner,
         imports: &ImportObject,
@@ -510,8 +550,22 @@ impl ImportBacking {
         }
     }
 
+    /// Gets a `ImportedFunc` from the given `ImportedFuncIndex`.
     pub fn imported_func(&self, index: ImportedFuncIndex) -> vm::ImportedFunc {
         self.vm_functions[index].clone()
+    }
+}
+
+impl Drop for ImportBacking {
+    fn drop(&mut self) {
+        // Properly drop the `vm::FuncCtx` in `vm::ImportedFunc`.
+        for (_imported_func_index, imported_func) in (*self.vm_functions).iter_mut() {
+            let func_ctx_ptr = imported_func.func_ctx.as_ptr();
+
+            if !func_ctx_ptr.is_null() {
+                let _: Box<vm::FuncCtx> = unsafe { Box::from_raw(func_ctx_ptr) };
+            }
+        }
     }
 }
 
@@ -536,9 +590,9 @@ fn import_functions(
         let namespace = module.info.namespace_table.get(*namespace_index);
         let name = module.info.name_table.get(*name_index);
 
-        let import = imports
-            .get_namespace(namespace)
-            .and_then(|namespace| namespace.get_export(name));
+        let import =
+            imports.maybe_with_namespace(namespace, |namespace| namespace.get_export(name));
+
         match import {
             Some(Export::Function {
                 func,
@@ -548,10 +602,28 @@ fn import_functions(
                 if *expected_sig == *signature {
                     functions.push(vm::ImportedFunc {
                         func: func.inner(),
-                        vmctx: match ctx {
-                            Context::External(ctx) => ctx,
-                            Context::Internal => vmctx,
-                        },
+                        func_ctx: NonNull::new(Box::into_raw(Box::new(vm::FuncCtx {
+                            //                      ^^^^^^^^ `vm::FuncCtx` is purposely leaked.
+                            //                               It is dropped by the specific `Drop`
+                            //                               implementation of `ImportBacking`.
+                            vmctx: NonNull::new(match ctx {
+                                Context::External(vmctx) => vmctx,
+                                Context::ExternalWithEnv(vmctx_, _) => {
+                                    if vmctx_.is_null() {
+                                        vmctx
+                                    } else {
+                                        vmctx_
+                                    }
+                                }
+                                Context::Internal => vmctx,
+                            })
+                            .expect("`vmctx` must not be null."),
+                            func_env: match ctx {
+                                Context::ExternalWithEnv(_, func_env) => func_env,
+                                _ => None,
+                            },
+                        })))
+                        .unwrap(),
                     });
                 } else {
                     link_errors.push(LinkError::IncorrectImportSignature {
@@ -579,9 +651,18 @@ fn import_functions(
             }
             None => {
                 if imports.allow_missing_functions {
+                    let always_trap = Func::new(always_trap);
+
                     functions.push(vm::ImportedFunc {
-                        func: ::std::ptr::null(),
-                        vmctx: ::std::ptr::null_mut(),
+                        func: always_trap.get_vm_func().as_ptr(),
+                        func_ctx: NonNull::new(Box::into_raw(Box::new(vm::FuncCtx {
+                            //                      ^^^^^^^^ `vm::FuncCtx` is purposely leaked.
+                            //                               It is dropped by the specific `Drop`
+                            //                               implementation of `ImportBacking`.
+                            vmctx: NonNull::new(vmctx).expect("`vmctx` must not be null."),
+                            func_env: None,
+                        })))
+                        .unwrap(),
                     });
                 } else {
                     link_errors.push(LinkError::ImportNotFound {
@@ -593,7 +674,7 @@ fn import_functions(
         }
     }
 
-    if link_errors.len() > 0 {
+    if !link_errors.is_empty() {
         Err(link_errors)
     } else {
         Ok(functions.into_boxed_map())
@@ -624,9 +705,8 @@ fn import_memories(
         let namespace = module.info.namespace_table.get(*namespace_index);
         let name = module.info.name_table.get(*name_index);
 
-        let memory_import = imports
-            .get_namespace(&namespace)
-            .and_then(|namespace| namespace.get_export(&name));
+        let memory_import =
+            imports.maybe_with_namespace(namespace, |namespace| namespace.get_export(name));
         match memory_import {
             Some(Export::Memory(memory)) => {
                 if expected_memory_desc.fits_in_imported(memory.descriptor()) {
@@ -665,7 +745,7 @@ fn import_memories(
         }
     }
 
-    if link_errors.len() > 0 {
+    if !link_errors.is_empty() {
         Err(link_errors)
     } else {
         Ok((memories.into_boxed_map(), vm_memories.into_boxed_map()))
@@ -696,9 +776,8 @@ fn import_tables(
         let namespace = module.info.namespace_table.get(*namespace_index);
         let name = module.info.name_table.get(*name_index);
 
-        let table_import = imports
-            .get_namespace(&namespace)
-            .and_then(|namespace| namespace.get_export(&name));
+        let table_import =
+            imports.maybe_with_namespace(namespace, |namespace| namespace.get_export(name));
         match table_import {
             Some(Export::Table(mut table)) => {
                 if expected_table_desc.fits_in_imported(table.descriptor()) {
@@ -767,9 +846,8 @@ fn import_globals(
     {
         let namespace = module.info.namespace_table.get(*namespace_index);
         let name = module.info.name_table.get(*name_index);
-        let import = imports
-            .get_namespace(namespace)
-            .and_then(|namespace| namespace.get_export(name));
+        let import =
+            imports.maybe_with_namespace(namespace, |namespace| namespace.get_export(name));
         match import {
             Some(Export::Global(mut global)) => {
                 if global.descriptor() == *imported_global_desc {
@@ -808,7 +886,7 @@ fn import_globals(
         }
     }
 
-    if link_errors.len() > 0 {
+    if !link_errors.is_empty() {
         Err(link_errors)
     } else {
         Ok((globals.into_boxed_map(), vm_globals.into_boxed_map()))

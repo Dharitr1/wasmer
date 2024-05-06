@@ -39,12 +39,16 @@ impl Atomic for f64 {
     type Output = AtomicU64;
 }
 
+/// A trait that represants an atomic type.
 pub trait Atomicity {}
+/// Atomically.
 pub struct Atomically;
 impl Atomicity for Atomically {}
+/// Non-atomically.
 pub struct NonAtomically;
 impl Atomicity for NonAtomically {}
 
+/// A view into a memory.
 pub struct MemoryView<'a, T: 'a, A = NonAtomically> {
     ptr: *mut T,
     length: usize,
@@ -65,6 +69,7 @@ where
 }
 
 impl<'a, T: Atomic> MemoryView<'a, T> {
+    /// Get atomic access to a memory view.
     pub fn atomically(&self) -> MemoryView<'a, T::Output, Atomically> {
         MemoryView {
             ptr: self.ptr as *mut T::Output,
@@ -77,7 +82,9 @@ impl<'a, T: Atomic> MemoryView<'a, T> {
 impl<'a, T> Deref for MemoryView<'a, T, NonAtomically> {
     type Target = [Cell<T>];
     fn deref(&self) -> &[Cell<T>] {
-        unsafe { slice::from_raw_parts(self.ptr as *const Cell<T>, self.length) }
+        let mut_slice: &mut [T] = unsafe { slice::from_raw_parts_mut(self.ptr, self.length) };
+        let cell_slice: &Cell<[T]> = Cell::from_mut(mut_slice);
+        cell_slice.as_slice_of_cells()
     }
 }
 

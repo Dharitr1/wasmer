@@ -1,28 +1,30 @@
-use crate::cache::TrampolineCache;
+use crate::{cache::TrampolineCache, resolver::NoopStackmapSink};
 use cranelift_codegen::{
     binemit::{NullTrapSink, Reloc, RelocSink},
     cursor::{Cursor, FuncCursor},
     ir::{self, InstBuilder},
     isa, Context,
 };
-use std::collections::HashMap;
-use std::{iter, mem, ptr::NonNull};
+use std::{collections::HashMap, iter, mem};
 use wasmer_runtime_core::{
     backend::sys::{Memory, Protect},
     module::{ExportIndex, ModuleInfo},
+    typed_func::Trampoline,
     types::{FuncSig, SigIndex, Type},
-    vm,
 };
 
 struct NullRelocSink {}
 
 impl RelocSink for NullRelocSink {
-    fn reloc_ebb(&mut self, _: u32, _: Reloc, _: u32) {}
+    fn reloc_block(&mut self, _: u32, _: Reloc, _: u32) {}
     fn reloc_external(&mut self, _: u32, _: Reloc, _: &ir::ExternalName, _: i64) {}
+
+    fn reloc_constant(&mut self, _: u32, _: Reloc, _: u32) {
+        unimplemented!("RelocSink::reloc_constant")
+    }
+
     fn reloc_jt(&mut self, _: u32, _: Reloc, _: ir::JumpTable) {}
 }
-
-pub type Trampoline = unsafe extern "C" fn(*mut vm::Ctx, NonNull<vm::Func>, *const u64, *mut u64);
 
 pub struct Trampolines {
     memory: Memory,
@@ -89,12 +91,13 @@ impl Trampolines {
             ctx.func = trampoline_func;
 
             let mut code_buf = Vec::new();
-
+            let mut stackmap_sink = NoopStackmapSink {};
             ctx.compile_and_emit(
                 isa,
                 &mut code_buf,
                 &mut NullRelocSink {},
                 &mut NullTrapSink {},
+                &mut stackmap_sink,
             )
             .expect("unable to compile trampolines");
             ctx.clear();
@@ -155,12 +158,12 @@ fn generate_func(func_sig: &FuncSig) -> ir::Function {
 
     let export_sig_ref = func.import_signature(generate_export_signature(func_sig));
 
-    let entry_ebb = func.dfg.make_ebb();
-    let vmctx_ptr = func.dfg.append_ebb_param(entry_ebb, ir::types::I64);
-    let func_ptr = func.dfg.append_ebb_param(entry_ebb, ir::types::I64);
-    let args_ptr = func.dfg.append_ebb_param(entry_ebb, ir::types::I64);
-    let returns_ptr = func.dfg.append_ebb_param(entry_ebb, ir::types::I64);
-    func.layout.append_ebb(entry_ebb);
+    let entry_ebb = func.dfg.make_block();
+    let vmctx_ptr = func.dfg.append_block_param(entry_ebb, ir::types::I64);
+    let func_ptr = func.dfg.append_block_param(entry_ebb, ir::types::I64);
+    let args_ptr = func.dfg.append_block_param(entry_ebb, ir::types::I64);
+    let returns_ptr = func.dfg.append_block_param(entry_ebb, ir::types::I64);
+    func.layout.append_block(entry_ebb);
 
     let mut pos = FuncCursor::new(&mut func).at_first_insertion_point(entry_ebb);
 

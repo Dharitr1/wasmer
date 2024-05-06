@@ -1,5 +1,20 @@
+//! Wasmer Runtime Core Library
+//!
+//! This crate provides common data structures which are shared by compiler backends
+//! to implement a WebAssembly runtime.
+//!
+//! This crate also provides an API for users who use wasmer as an embedded wasm runtime which
+//! allows operations like compiling, instantiating, providing imports, access exports, memories,
+//! and tables for example.
+//!
+//! Most wasmer users should prefer the API which is re-exported by the `wasmer-runtime`
+//! library by default. This crate provides additional APIs which may be useful to users
+//! that wish to customize the wasmer runtime.
+//!
+
 #![deny(
     dead_code,
+    missing_docs,
     nonstandard_style,
     unused_imports,
     unused_mut,
@@ -10,10 +25,6 @@
 #![cfg_attr(nightly, feature(unwind_attributes))]
 #![doc(html_favicon_url = "https://wasmer.io/static/icons/favicon.ico")]
 #![doc(html_logo_url = "https://avatars3.githubusercontent.com/u/44205449?s=200&v=4")]
-
-#[cfg(test)]
-#[macro_use]
-extern crate field_offset;
 
 #[macro_use]
 extern crate serde_derive;
@@ -53,8 +64,10 @@ pub mod vm;
 pub mod vmcalls;
 #[cfg(all(unix, target_arch = "x86_64"))]
 pub use trampoline_x64 as trampoline;
-#[cfg(all(unix, target_arch = "x86_64"))]
+#[cfg(unix)]
 pub mod fault;
+#[cfg(feature = "generate-debug-information")]
+pub mod jit_debug;
 pub mod state;
 #[cfg(feature = "managed")]
 pub mod tiering;
@@ -77,6 +90,9 @@ pub use wasmparser;
 use self::cache::{Artifact, Error as CacheError};
 
 pub mod prelude {
+    //! The prelude module is a helper module used to bring commonly used runtime core imports into
+    //! scope.
+
     pub use crate::import::{ImportObject, Namespace};
     pub use crate::types::{
         FuncIndex, GlobalIndex, ImportedFuncIndex, ImportedGlobalIndex, ImportedMemoryIndex,
@@ -87,12 +103,12 @@ pub mod prelude {
     pub use crate::{func, imports};
 }
 
+pub use crate::import::{ImportObject, Namespace};
+
 /// Compile a [`Module`] using the provided compiler from
 /// WebAssembly binary code. This function is useful if it
 /// is necessary to a compile a module before it can be instantiated
 /// and must be used if you wish to use a different backend from the default.
-///
-/// [`Module`]: struct.Module.html
 pub fn compile_with(
     wasm: &[u8],
     compiler: &dyn backend::Compiler,
@@ -145,20 +161,23 @@ pub fn validate_and_report_errors_with_features(
             enable_multi_value: false,
             enable_reference_types: false,
             enable_threads: features.threads,
+
+            #[cfg(feature = "deterministic-execution")]
+            deterministic_only: true,
         },
-        mutable_global_imports: true,
     };
     let mut parser = wasmparser::ValidatingParser::new(wasm, Some(config));
     loop {
         let state = parser.read();
         match *state {
             wasmparser::ParserState::EndWasm => break Ok(()),
-            wasmparser::ParserState::Error(e) => break Err(format!("{}", e)),
+            wasmparser::ParserState::Error(ref e) => break Err(format!("{}", e)),
             _ => {}
         }
     }
 }
 
+/// Creates a new module from the given cache [`Artifact`] for the specified compiler backend
 pub unsafe fn load_cache_with(
     cache: Artifact,
     compiler: &dyn backend::Compiler,

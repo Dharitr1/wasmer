@@ -1,6 +1,0 @@
-# Ignore everything
-**
-!lib/**
-!src/**
-!Cargo.toml
-!Cargo.lock

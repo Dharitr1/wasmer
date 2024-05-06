@@ -6,7 +6,12 @@ use wasmer_runtime_core::{
     Instance,
 };
 
-static INTERNAL_FIELD: InternalField = InternalField::allocate();
+use crate::metering_costs::{get_opcode_index, get_local_allocate_cost_index};
+use crate::runtime_breakpoints::push_runtime_breakpoint;
+
+static FIELD_USED_POINTS: InternalField = InternalField::allocate();
+static FIELD_POINTS_LIMIT: InternalField = InternalField::allocate();
+pub const BREAKPOINT_VALUE__OUT_OF_GAS: u64 = 4;
 
 /// Metering is a compiler middleware that calculates the cost of WebAssembly instructions at compile
 /// time and will count the cost of executed instructions at runtime. Within the Metering functionality,
@@ -20,16 +25,21 @@ static INTERNAL_FIELD: InternalField = InternalField::allocate();
 /// Each compiler backend with Metering enabled should produce the same cost used at runtime for
 /// the same function calls so we can say that the metering is deterministic.
 ///
-pub struct Metering {
-    limit: u64,
+
+pub struct Metering<'a> {
+    unmetered_locals: usize,
     current_block: u64,
+    func_locals_costs: u32,
+    opcode_costs: &'a [u32],
 }
 
-impl Metering {
-    pub fn new(limit: u64) -> Metering {
+impl<'a> Metering<'a> {
+    pub fn new(opcode_costs: &'a [u32], unmetered_locals: usize) -> Metering<'a> {
         Metering {
-            limit,
+            unmetered_locals,
             current_block: 0,
+            func_locals_costs: 0,
+            opcode_costs,
         }
     }
 }
@@ -37,20 +47,23 @@ impl Metering {
 #[derive(Copy, Clone, Debug)]
 pub struct ExecutionLimitExceededError;
 
-impl FunctionMiddleware for Metering {
+impl<'q> FunctionMiddleware for Metering<'q> {
     type Error = String;
+
     fn feed_event<'a, 'b: 'a>(
         &mut self,
         op: Event<'a, 'b>,
         _module_info: &ModuleInfo,
         sink: &mut EventSink<'a, 'b>,
+        _source_loc: u32,
     ) -> Result<(), Self::Error> {
         match op {
             Event::Internal(InternalEvent::FunctionBegin(_)) => {
-                self.current_block = 0;
+                self.current_block = self.func_locals_costs as u64;
             }
             Event::Wasm(&ref op) | Event::WasmOwned(ref op) => {
-                self.current_block += 1;
+                let opcode_index = get_opcode_index(op);
+                self.current_block += self.opcode_costs[opcode_index] as u64;
                 match *op {
                     Operator::Loop { .. }
                     | Operator::Block { .. }
@@ -65,14 +78,14 @@ impl FunctionMiddleware for Metering {
                     | Operator::CallIndirect { .. }
                     | Operator::Return => {
                         sink.push(Event::Internal(InternalEvent::GetInternal(
-                            INTERNAL_FIELD.index() as _,
+                            FIELD_USED_POINTS.index() as _,
                         )));
                         sink.push(Event::WasmOwned(Operator::I64Const {
                             value: self.current_block as i64,
                         }));
                         sink.push(Event::WasmOwned(Operator::I64Add));
                         sink.push(Event::Internal(InternalEvent::SetInternal(
-                            INTERNAL_FIELD.index() as _,
+                            FIELD_USED_POINTS.index() as _,
                         )));
                         self.current_block = 0;
                     }
@@ -85,18 +98,16 @@ impl FunctionMiddleware for Metering {
                     | Operator::Call { .. }
                     | Operator::CallIndirect { .. } => {
                         sink.push(Event::Internal(InternalEvent::GetInternal(
-                            INTERNAL_FIELD.index() as _,
+                            FIELD_USED_POINTS.index() as _,
                         )));
-                        sink.push(Event::WasmOwned(Operator::I64Const {
-                            value: self.limit as i64,
-                        }));
+                        sink.push(Event::Internal(InternalEvent::GetInternal(
+                            FIELD_POINTS_LIMIT.index() as _,
+                        )));
                         sink.push(Event::WasmOwned(Operator::I64GeU));
                         sink.push(Event::WasmOwned(Operator::If {
                             ty: WpTypeOrFuncType::Type(WpType::EmptyBlockType),
                         }));
-                        sink.push(Event::Internal(InternalEvent::Breakpoint(Box::new(|_| {
-                            Err(Box::new(ExecutionLimitExceededError))
-                        }))));
+                        push_runtime_breakpoint(sink, BREAKPOINT_VALUE__OUT_OF_GAS);
                         sink.push(Event::WasmOwned(Operator::End));
                     }
                     _ => {}
@@ -104,27 +115,51 @@ impl FunctionMiddleware for Metering {
             }
             _ => {}
         }
+
         sink.push(op);
+
+        Ok(())
+    }
+
+    fn feed_local(
+        &mut self,
+        _ty: WpType,
+        n: usize,
+        _loc: u32,
+    ) -> Result<(), Self::Error>{
+        if n > self.unmetered_locals {
+            let metered_locals = (n  - self.unmetered_locals) as u32;
+            let cost_index = get_local_allocate_cost_index();
+            let cost = self.opcode_costs[cost_index];
+            // n is already limited by Wasmparser; the following casting and multiplication are
+            // safe from overflowing
+            self.func_locals_costs += cost * metered_locals;
+        }
         Ok(())
     }
 }
 
 /// Returns the number of points used by an Instance.
 pub fn get_points_used(instance: &Instance) -> u64 {
-    instance.get_internal(&INTERNAL_FIELD)
+    instance.get_internal(&FIELD_USED_POINTS)
 }
 
 /// Sets the number of points used by an Instance.
 pub fn set_points_used(instance: &mut Instance, value: u64) {
-    instance.set_internal(&INTERNAL_FIELD, value);
+    instance.set_internal(&FIELD_USED_POINTS, value);
+}
+
+/// Sets the limit of points to be used by an Instance.
+pub fn set_points_limit(instance: &mut Instance, value: u64) {
+    instance.set_internal(&FIELD_POINTS_LIMIT, value);
 }
 
 /// Returns the number of points used in a Ctx.
 pub fn get_points_used_ctx(ctx: &Ctx) -> u64 {
-    ctx.get_internal(&INTERNAL_FIELD)
+    ctx.get_internal(&FIELD_USED_POINTS)
 }
 
 /// Sets the number of points used in a Ctx.
 pub fn set_points_used_ctx(ctx: &mut Ctx, value: u64) {
-    ctx.set_internal(&INTERNAL_FIELD, value);
+    ctx.set_internal(&FIELD_USED_POINTS, value);
 }
