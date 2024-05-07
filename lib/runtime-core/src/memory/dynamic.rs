@@ -109,8 +109,13 @@ impl DynamicMemory {
 
     /// Shrink the memory to the minimum number of pages.
     pub fn shrink_to_minimum(&mut self, local: &mut vm::LocalMemory) {
-        let min_size = self.min.bytes().0;
-        _= self.memory.split_at(min_size);
+        if self.size() == self.min {
+            return;
+        }
+
+        let min_size = self.min.bytes().0 + DYNAMIC_GUARD_SIZE;
+
+        self.memory.split_at(min_size);
 
         local.base = self.memory.as_ptr();
         local.bound = min_size;
