@@ -38,7 +38,7 @@
 * **Pluggable**: Wasmer can be used from almost **any programming language**
 * **Safe**: supporting [WASI](https://github.com/WebAssembly/WASI) and [Emscripten](https://emscripten.org/)
 
-It is used, to run software fast, universally and safely: standalone applications and universal libraries.
+It is used to run software fast, universally and safely: standalone applications and universal libraries.
 
 ## Contents
 
